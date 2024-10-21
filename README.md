@@ -69,10 +69,10 @@ Since the _exact_ setup varies somewhat depending on the available hardware (GPU
 * The implementation of [NOCD](https://github.com/shchur/overlapping-community-detection), a baseline that is used in the experiments
 * Infomap as a baseline, which is available as the python package `infomap`
 * Some "standard" python libraries: `matplotlib`, `seaborn`, `scikit-learn`, `networkx`
-* Some synthetic LFR networks that are [available here]() (generated with code [available here](https://sites.google.com/site/andrealancichinetti/benchmarks))
-* The results of our experiments can be found [here]()
+* Some synthetic LFR networks that are [available here](https://doi.org/10.5281/zenodo.13961218) (generated with code [available here](https://sites.google.com/site/andrealancichinetti/benchmarks))
+* The results of our experiments can be found [here](https://doi.org/10.5281/zenodo.13961218)
 
-Or perhaps you are just interested in looking at the results, which are included in the notebooks.
+Or perhaps you are just interested in looking at the plots of the results, which are included in the notebooks.
 
 ## Citation
 If you're using Neuromap, please cite \
