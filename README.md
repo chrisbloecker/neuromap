@@ -8,11 +8,16 @@ The map equation adopts a compression perspective and quantifies how efficiently
 Those communities that lead to the best compression are considered to describe the organisational structure of the network well.
 The map equation's basic principles are described in the paper; more detailed explanations can be found in [Community Detection with the Map Equation and Infomap: Theory and Applications](https://arxiv.org/abs/2311.04036).
 
+The basic princple goes like this: (1) split the network into communities; (2) assign codewords to the nodes that are unique within each community, for example using Huffman codes; (3) compute how many bits are required per step that a random walker takes on the network -- this is the so-called codelength. The lower the codelength, the better the partition from step (1).
+**In practice** no codewords or random walks are used, instead, the map equation computes the codelength analytically.
+
 <img src="img/map-equation-principle.svg" alt="Two different ways to partition the same network into communities. The right-hand variant leads to a lower codelength." width="800"/>
 
 
+
+
 ## How Neuromap works
-"Neuromap" refers to using the map equation as a loss function in combination with (graph) neural networks to learn (soft) cluster assignmants, that is, communities.
+"Neuromap" refers to using the map equation as a loss function in combination with (graph) neural networks to learn (soft) cluster assignmants (communities).
 The figure below shows the general setup, where the input consists of a graph, and the output is a soft cluster assignment matrix, optimised in an unsupervised fashion by minimising the map equation through gradient descent.
 
 <img src="img/neuromap-architecture.svg" alt="The Neuromap architecture for learning soft cluster assignments minimising the map equation through gradient descent." width="800"/>
@@ -58,13 +63,17 @@ def L(S: torch.tensor, F: torch.tensor, p: torch.tensor) -> float:
 The self-contained `example-usage.py` notebook is intended to provide a minimal example as a starting point.
 
 ## Requirements
-To run the code in this repository, you will need
+To run the code in this repository, you will need a couple of libraries.
+Since the _exact_ setup varies somewhat depending on the available hardware (GPU available or not?), please refer to the documentation of the respective library.
 * [PyTorch](https://pytorch.org/)
 * [PyG](https://pytorch-geometric.readthedocs.io/en/latest/)
 * [PyTorch Geometric Signed Directed](https://pytorch-geometric-signed-directed.readthedocs.io/en/latest/index.html)
 * [Open Graph Benchmark (OGB)](https://ogb.stanford.edu/)
 * The implementation of [NOCD](https://github.com/shchur/overlapping-community-detection), a baseline that is used in the experiments
-* Some synthetic LFR networks that are available [here]() (generated with code available [here](https://sites.google.com/site/andrealancichinetti/benchmarks))
+* Infomap as a baseline, which is available as the python package `infomap`
+* Some "standard" python libraries: `matplotlib`, `seaborn`, `scikit-learn`, `networkx`
+* Some synthetic LFR networks that are [available here]() (generated with code [available here](https://sites.google.com/site/andrealancichinetti/benchmarks))
+* The results of our experiments can be found [here]()
 
 Or perhaps you are just interested in looking at the results, which are included in the notebooks.
 
