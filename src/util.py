@@ -305,3 +305,51 @@ def load_modules(filename):
             assignments[int(u.strip())] = int(m.strip())
 
     return assignments
+
+
+def data_to_networkx(data, directed):
+    sources, targets = data.edge_index.indices().cpu().numpy()
+    weights          = data.edge_index.values().cpu().numpy()
+
+    G = nx.DiGraph() if directed else nx.Graph()
+    for u in range(data.edge_index.shape[0]):
+        G.add_node(u)
+    for s, t, w in zip(sources, targets, weights):
+        G.add_edge(int(s), int(t), weight = float(w))
+    
+    return G
+
+
+def get_mixing(data, directed):
+    G = data_to_networkx(data, directed = directed)
+    y = data.y.cpu().numpy()
+
+    intra = 0
+    inter = 0
+
+    for (u,v) in G.edges:
+        if y[u] == y[v]:
+            intra += 1
+        else:
+            inter += 1
+    
+    return inter / (inter + intra)
+
+
+def get_dataset_stats(dataset, data):
+    print()
+    print(f"Dataset: {dataset}:")
+    print("======================")
+    print(f"Number of graphs: {len(dataset)}")
+    print(f"Number of features: {dataset.num_features}")
+    print(f"Number of classes: {dataset.num_classes}")
+
+    print()
+    print(data)
+    print("===========================================================================================================")
+
+    print(f"Number of edges: {data.num_edges}")
+    print(f"Average node degree: {data.num_edges / data.num_nodes:.1f}")
+    print(f"Has isolated nodes: {data.has_isolated_nodes()}")
+    print(f"Has self-loops: {data.has_self_loops()}")
+    print(f"Is undirected: {data.is_undirected()}")
