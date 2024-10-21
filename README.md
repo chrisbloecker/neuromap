@@ -25,39 +25,36 @@ The figure below shows the general setup, where the input consists of a graph, a
 The core component is the (two-level) map equation, which can be expressed as follows in python, using `torch`:
 
 ```python
-# map equation loss function
-def L(S: torch.tensor, F: torch.tensor, p: torch.tensor) -> float:
-    """
-    Computes the codelength, L, as defined by the map equation.
+class MapEquationPooling(torch.nn.Module):
+    def __init__(self, adj: Tensor, device: str = "cpu", *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
 
-    Parameters
-    ----------
-    S: A soft cluster assignment matrix.
+        self.adj       = adj
+        self.F, self.p = mkSmartTeleportationFlow(self.adj, device = device)
 
-    F: The network's flow matrix.
+        # this term is constant, so only calculate it once
+        self.p_log_p = torch.sum(self.p * torch.nan_to_num(torch.log2(self.p), nan = 0.0))
 
-    p: A vector with the nodes' visit rates.
+    def forward(self, x, s):
+        C      = s.T @ self.F @ s
+        diag_C = torch.diag(C)
 
-    Returns
-    -------
-    The codelength for the given soft clusters on the network with the given
-    flow matrix and node visit rates.
-    """
-    C      = S.T @ F @ S
-    diag_C = torch.diag(C)
+        q      = 1.0 - torch.trace(C)
+        q_m    = torch.sum(C, dim = 1) - diag_C
+        m_exit = torch.sum(C, dim = 0) - diag_C
+        p_m    = q_m + torch.sum(C, dim = 0)
 
-    q      = 1.0 - torch.trace(C)
-    q_m    = torch.sum(C, dim = 1) - diag_C
-    m_exit = torch.sum(C, dim = 0) - diag_C
-    p_m    = q_m + torch.sum(C, dim = 0)
 
-    codelength = torch.sum(q      * torch.nan_to_num(torch.log2(q),      nan = 0.0)) \
-               - torch.sum(q_m    * torch.nan_to_num(torch.log2(q_m),    nan = 0.0)) \
-               - torch.sum(m_exit * torch.nan_to_num(torch.log2(m_exit), nan = 0.0)) \
-               - torch.sum(p      * torch.nan_to_num(torch.log2(p),      nan = 0.0)) \
-               + torch.sum(p_m    * torch.nan_to_num(torch.log2(p_m),    nan = 0.0))
+        codelength = torch.sum(q      * torch.nan_to_num(torch.log2(q),      nan = 0.0)) \
+                   - torch.sum(q_m    * torch.nan_to_num(torch.log2(q_m),    nan = 0.0)) \
+                   - torch.sum(m_exit * torch.nan_to_num(torch.log2(m_exit), nan = 0.0)) \
+                   - self.p_log_p \
+                   + torch.sum(p_m    * torch.nan_to_num(torch.log2(p_m),    nan = 0.0))
 
-    return codelength
+        x_pooled   = torch.matmul(s.T, x)
+        adj_pooled = s.T @ self.adj @ s
+
+        return x_pooled, adj_pooled, codelength
 ```
 
 The self-contained `example-usage.py` notebook is intended to provide a minimal example as a starting point.
