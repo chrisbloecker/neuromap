@@ -334,6 +334,11 @@ class Neuromap(Cluster):
         self.t = Parameter(torch.zeros(1, device = self.device))
 
 
+    def _reset(self):
+        super()._reset()
+        torch.nn.init.zeros_(self.t)
+
+
     def forward(self, x):
         s = softmax(self.model(x) / sigmoid(self.t), dim = 1)
 
@@ -419,6 +424,10 @@ class DMoN(Cluster):
                         , **kwargs
                         )
 
+    def _reset(self):
+        super()._reset()
+        self.pool = DMoNPooling(channels = [self.out_channels, self.out_channels], k = self.out_channels, dropout = self.dropout).to(device = self.device)
+
     def forward(self, x):
         x = self.model(x)
         x, _, adj, sp, o, c = self.pool(x = x, adj = self.data.edge_index)
@@ -428,18 +437,6 @@ class DMoN(Cluster):
         loss = sp + c
 
         return loss, x
-
-    def fit( self
-           , data        : Data
-           , epochs      : int         = 10000
-           , patience    : int         =   100
-           , lrs         : List[float] = [10**(-3)]
-           , lr_schedule : bool        = False
-           , num_trials  : int         =     1
-           , verbose     : bool        = False
-           ):
-        self.pool = DMoNPooling(channels = [self.out_channels, self.out_channels], k = self.out_channels, dropout = self.dropout).to(device = self.device)
-        return super().fit(data = data, epochs = epochs, patience = patience, lrs = lrs, lr_schedule = lr_schedule, num_trials = num_trials, verbose = verbose)
 
 
 class DiffPool(Cluster):
