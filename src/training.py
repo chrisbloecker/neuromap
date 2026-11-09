@@ -17,12 +17,12 @@ import gc
 
 
 # create smart teleportation flow matrix and flow distribution
-def mkSmartTeleportationFlow(A, alpha = 0.15, iter = 1000, device : str = "cpu"):
+def mkSmartTeleportationFlow(A, alpha = 0.15, iter = 1000):
     # build the transition matrix
-    T = torch.nan_to_num(A.T * (torch.sum(A, 1)**(-1.0)).to_dense(), nan = 0.0).T.to(device = device)
+    T = torch.nan_to_num(A.T * (torch.sum(A, 1)**(-1.0)).to_dense(), nan = 0.0).T
 
     # distribution according to nodes' in-degrees
-    e_v = (torch.sum(A, dim = 0) / torch.sum(A)).to_dense().to(device = device)
+    e_v = (torch.sum(A, dim = 0) / torch.sum(A)).to_dense()
 
     # calculate the flow distribution with a power iteration
     p = e_v
@@ -36,11 +36,11 @@ def mkSmartTeleportationFlow(A, alpha = 0.15, iter = 1000, device : str = "cpu")
 
 
 class MapEquationPooling(torch.nn.Module):
-    def __init__(self, adj: Tensor, device : str = "cpu", *args, **kwargs) -> None:
+    def __init__(self, adj: Tensor, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
 
         self.adj       = adj
-        self.F, self.p = mkSmartTeleportationFlow(self.adj, device = device)
+        self.F, self.p = mkSmartTeleportationFlow(self.adj)
 
         # this term is constant, so only calculate it once
         self.p_log_p = torch.sum(self.p * torch.nan_to_num(torch.log2(self.p), nan = 0.0))
@@ -360,7 +360,7 @@ class Neuromap(Cluster):
            , verbose     : bool        = False
            ):
         self.data = data.to(device = self.device)
-        self.pool = MapEquationPooling(adj = data.edge_index, device = self.device)
+        self.pool = MapEquationPooling(adj = self.data.edge_index)
         
         return super().fit(data = data, epochs = epochs, patience = patience, lrs = lrs, lr_schedule = lr_schedule, num_trials = num_trials, verbose = verbose)
 
