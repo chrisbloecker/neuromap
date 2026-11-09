@@ -328,8 +328,10 @@ class Neuromap(Cluster):
                         , **kwargs
                         )
 
-        # softmax temperature
-        self.t = Parameter(torch.zeros(1)).to(device = self.device)
+        # softmax temperature, created directly on the device: moving a Parameter
+        # to another device with .to() returns a plain tensor, which the
+        # optimiser does not train
+        self.t = Parameter(torch.zeros(1, device = self.device))
 
 
     def forward(self, x):
@@ -353,7 +355,7 @@ class Neuromap(Cluster):
            , verbose     : bool        = False
            ):
         self.data = data.to(device = self.device)
-        self.pool = MapEquationPooling(adj = data.edge_index)
+        self.pool = MapEquationPooling(adj = data.edge_index, device = self.device)
         
         return super().fit(data = data, epochs = epochs, patience = patience, lrs = lrs, lr_schedule = lr_schedule, num_trials = num_trials, verbose = verbose)
 
