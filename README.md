@@ -3,12 +3,12 @@ Companion repository for the paper **The Map Equation Goes Neural: Mapping Netwo
 The paper adapts the map equation, an information-theoretic objective function for community detection, as a loss function for detecting communities with (graph) neural networks.
 
 ## How the map equation works
-The map equation is an information-theoretic objective function for community detection in complext networks.
+The map equation is an information-theoretic objective function for community detection in complex networks.
 The map equation adopts a compression perspective and quantifies how efficiently a random walk on a network can be described based on the given communities.
 Those communities that lead to the best compression are considered to describe the organisational structure of the network well.
 The map equation's basic principles are described in the paper; more detailed explanations can be found in [Community Detection with the Map Equation and Infomap: Theory and Applications](https://arxiv.org/abs/2311.04036).
 
-The basic princple goes like this: (1) split the network into communities; (2) assign codewords to the nodes that are unique within each community, for example using Huffman codes; (3) compute how many bits are required per step that a random walker takes on the network -- this is the so-called codelength. The lower the codelength, the better the partition from step (1).
+The basic principle goes like this: (1) split the network into communities; (2) assign codewords to the nodes that are unique within each community, for example using Huffman codes; (3) compute how many bits are required per step that a random walker takes on the network -- this is the so-called codelength. The lower the codelength, the better the partition from step (1).
 **In practice** no codewords or random walks are used, instead, the map equation computes the codelength analytically.
 
 <img src="img/map-equation-principle.svg" alt="Two different ways to partition the same network into communities. The right-hand variant leads to a lower codelength." width="800"/>
@@ -17,12 +17,12 @@ The basic princple goes like this: (1) split the network into communities; (2) a
 
 
 ## How Neuromap works
-"Neuromap" refers to using the map equation as a loss function in combination with (graph) neural networks to learn (soft) cluster assignmants (communities).
+"Neuromap" refers to using the map equation as a loss function in combination with (graph) neural networks to learn (soft) cluster assignments (communities).
 The figure below shows the general setup, where the input consists of a graph, and the output is a soft cluster assignment matrix, optimised in an unsupervised fashion by minimising the map equation through gradient descent.
 
 <img src="img/neuromap-architecture.svg" alt="The Neuromap architecture for learning soft cluster assignments minimising the map equation through gradient descent." width="800"/>
 
-The core component is the (two-level) map equation, which can be expressed as follows in python, using `torch`:
+The core component is the (two-level) map equation, which can be expressed as follows in Python, using `torch`:
 
 ```python
 class MapEquationPooling(torch.nn.Module):
@@ -67,27 +67,21 @@ Since the _exact_ setup varies somewhat depending on the available hardware (GPU
 * [PyTorch Geometric Signed Directed](https://pytorch-geometric-signed-directed.readthedocs.io/en/latest/index.html)
 * [Open Graph Benchmark (OGB)](https://ogb.stanford.edu/)
 * The implementation of [NOCD](https://github.com/shchur/overlapping-community-detection), a baseline that is used in the experiments
-* Infomap as a baseline, which is available as the python package `infomap`
-* Some "standard" python libraries: `matplotlib`, `seaborn`, `scikit-learn`, `networkx`
+* Infomap as a baseline, which is available as the Python package `infomap`
+* Some "standard" Python libraries: `matplotlib`, `seaborn`, `scikit-learn`, `networkx`
 * Some synthetic LFR networks that are [available here](https://doi.org/10.5281/zenodo.13961218) (generated with code [available here](https://sites.google.com/site/andrealancichinetti/benchmarks))
 * The results of our experiments can be found [here](https://doi.org/10.5281/zenodo.13961218)
 
 Or perhaps you are just interested in looking at the plots of the results, which are included in the notebooks.
 
 ## Citation
-If you're using Neuromap, please cite \
-(Citation entry for the NeurIPS version is coming as soon as it becomes available...)
+If you're using Neuromap, please cite
 ```bibtext
-@misc{blöcker2024mapequationgoesneural,
-  title         = {The Map Equation Goes Neural: Mapping Network Flows with Graph Neural Networks},
-  author        = {Christopher Bl\"cker and Chester Tan and Ingo Scholtes},
-  year          = {2024},
-  publisher     = {arXiv},
-  doi           = {10.48550/arXiv.2310.01144},
-  url           = {https://doi.org/10.48550/arXiv.2310.01144},
-  eprint        = {2310.01144},
-  archivePrefix = {arXiv},
-  primaryClass  = {cs.LG},
-  howpublished  = {\href{https://doi.org/10.48550/arXiv.2310.01144}{arXiv:2310.01144}}
+@inproceedings{blocker2024mapequationgoesneural,
+  title={The Map Equation Goes Neural: Mapping Network Flows with Graph Neural Networks},
+  author={Christopher Bl{\"o}cker and Chester Tan and Ingo Scholtes},
+  booktitle={The Thirty-eighth Annual Conference on Neural Information Processing Systems},
+  year={2024},
+  url={https://openreview.net/forum?id=aFWx1N84Fe}
 }
 ```
