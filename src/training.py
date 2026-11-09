@@ -25,13 +25,25 @@ def mkSmartTeleportationFlow(A, alpha = 0.15, iter = 1000):
     e_v = (torch.sum(A, dim = 0) / torch.sum(A)).to_dense()
 
     # calculate the flow distribution with a power iteration
-    p = e_v
+    # p @ T is computed as T^T @ p with T^T in CSR format; a product with a COO matrix converts it to CSR on every call
+    # the iteration runs in float64, because in float32 the change per step can stall above the threshold
+    # stop when p changes by less than 1e-15 in L1 norm, as Infomap does
+    T_T = T.T.coalesce().to(dtype = torch.float64).to_sparse_csr()
+    e   = e_v.to(dtype = torch.float64)
+    p   = e
     for _ in range(iter):
-        p = alpha * e_v + (1-alpha) * p @ T
-    
+        p_next = alpha * e + (1-alpha) * (T_T @ p)
+        change = torch.sum(torch.abs(p_next - p))
+        p      = p_next
+        if change < 1e-15:
+            break
+    p = p.to(dtype = A.dtype)
+
     # make the flow matrix for minimising the map equation
-    F = alpha * A / torch.sum(A) + (1-alpha) * (p * T.T).T
-    
+    # the sum of the two terms stores every entry twice, so coalesce it
+    # store F in CSR format; a product with a COO matrix converts it to CSR on every call
+    F = (alpha * A / torch.sum(A) + (1-alpha) * (p * T.T).T).coalesce().to_sparse_csr()
+
     return F, p
 
 
@@ -39,14 +51,17 @@ class MapEquationPooling(torch.nn.Module):
     def __init__(self, adj: Tensor, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
 
-        self.adj       = adj
-        self.F, self.p = mkSmartTeleportationFlow(self.adj)
+        self.F, self.p = mkSmartTeleportationFlow(adj)
+
+        # store the adjacency in CSR format; a product with a COO matrix converts it to CSR on every call
+        self.adj = adj.coalesce().to_sparse_csr()
 
         # this term is constant, so only calculate it once
         self.p_log_p = torch.sum(self.p * torch.nan_to_num(torch.log2(self.p), nan = 0.0))
 
     def forward(self, x, s):
-        C = s.T @ self.F @ s
+        # multiply F @ s first; s.T @ F with F in CSR format is 2 to 6 times slower
+        C = s.T @ (self.F @ s)
 
         # flows between modules, summed from the off-diagonal entries of C
         # subtracting the diagonal from the row sums would round a flow of 1e-8 next to a flow near 1 to 0
@@ -65,7 +80,8 @@ class MapEquationPooling(torch.nn.Module):
                    + torch.sum(p_m    * torch.log2(p_m.clamp_min(1e-30)))
 
         x_pooled   = torch.matmul(s.T, x)
-        adj_pooled = s.T @ self.adj @ s
+        # multiply adj @ s first, for the same reason as F @ s above
+        adj_pooled = s.T @ (self.adj @ s)
 
         return x_pooled, adj_pooled, codelength
 
