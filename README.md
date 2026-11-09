@@ -36,20 +36,23 @@ class MapEquationPooling(torch.nn.Module):
         self.p_log_p = torch.sum(self.p * torch.nan_to_num(torch.log2(self.p), nan = 0.0))
 
     def forward(self, x, s):
-        C      = s.T @ self.F @ s
-        diag_C = torch.diag(C)
+        C = s.T @ self.F @ s
+
+        # flows between modules, summed from the off-diagonal entries of C
+        # subtracting the diagonal from the row sums would round a flow of 1e-8 next to a flow near 1 to 0
+        C_between = C - torch.diag(torch.diag(C))
 
         q      = 1.0 - torch.trace(C)
-        q_m    = torch.sum(C, dim = 1) - diag_C
-        m_exit = torch.sum(C, dim = 0) - diag_C
+        q_m    = torch.sum(C_between, dim = 1)
+        m_exit = torch.sum(C_between, dim = 0)
         p_m    = q_m + torch.sum(C, dim = 0)
 
-
-        codelength = torch.sum(q      * torch.nan_to_num(torch.log2(q),      nan = 0.0)) \
-                   - torch.sum(q_m    * torch.nan_to_num(torch.log2(q_m),    nan = 0.0)) \
-                   - torch.sum(m_exit * torch.nan_to_num(torch.log2(m_exit), nan = 0.0)) \
+        # clamp the input to log2, so that a flow of 0 gets a finite gradient instead of 0/0
+        codelength = torch.sum(q      * torch.log2(q.clamp_min(1e-30))) \
+                   - torch.sum(q_m    * torch.log2(q_m.clamp_min(1e-30))) \
+                   - torch.sum(m_exit * torch.log2(m_exit.clamp_min(1e-30))) \
                    - self.p_log_p \
-                   + torch.sum(p_m    * torch.nan_to_num(torch.log2(p_m),    nan = 0.0))
+                   + torch.sum(p_m    * torch.log2(p_m.clamp_min(1e-30)))
 
         x_pooled   = torch.matmul(s.T, x)
         adj_pooled = s.T @ self.adj @ s
