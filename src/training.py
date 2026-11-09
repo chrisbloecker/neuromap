@@ -328,9 +328,9 @@ class Neuromap(Cluster):
                         , **kwargs
                         )
 
-        # softmax temperature, created directly on the device: moving a Parameter
-        # to another device with .to() returns a plain tensor, which the
-        # optimiser does not train
+        # softmax temperature, created directly on the device
+        # moving a Parameter to the GPU with .to() returns a plain tensor
+        # a plain tensor is not in self.parameters(), so Adam would not train it
         self.t = Parameter(torch.zeros(1, device = self.device))
 
 
