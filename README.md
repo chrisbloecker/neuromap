@@ -26,11 +26,11 @@ The core component is the (two-level) map equation, which can be expressed as fo
 
 ```python
 class MapEquationPooling(torch.nn.Module):
-    def __init__(self, adj: Tensor, device: str = "cpu", *args, **kwargs) -> None:
+    def __init__(self, adj: Tensor, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
 
         self.adj       = adj
-        self.F, self.p = mkSmartTeleportationFlow(self.adj, device = device)
+        self.F, self.p = mkSmartTeleportationFlow(self.adj)
 
         # this term is constant, so only calculate it once
         self.p_log_p = torch.sum(self.p * torch.nan_to_num(torch.log2(self.p), nan = 0.0))
