@@ -42,7 +42,7 @@ class MapEquationPooling(torch.nn.Module):
         # subtracting the diagonal from the row sums would round a flow of 1e-8 next to a flow near 1 to 0
         C_between = C - torch.diag(torch.diag(C))
 
-        q      = 1.0 - torch.trace(C)
+        q      = torch.sum(C_between)
         q_m    = torch.sum(C_between, dim = 1)
         m_exit = torch.sum(C_between, dim = 0)
         p_m    = q_m + torch.sum(C, dim = 0)
