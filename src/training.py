@@ -79,7 +79,8 @@ class MapEquationPooling(torch.nn.Module):
                    - self.p_log_p \
                    + torch.sum(p_m    * torch.log2(p_m.clamp_min(1e-30)))
 
-        x_pooled   = torch.matmul(s.T, x)
+        # multiply x^T @ s first, for the same reason as F @ s above; for x in CSC format, x.t() is in CSR format
+        x_pooled   = (x.t() @ s).t()
         # multiply adj @ s first, for the same reason as F @ s above
         adj_pooled = s.T @ (self.adj @ s)
 
@@ -361,7 +362,8 @@ class Neuromap(Cluster):
     def forward(self, x):
         s = softmax(self.model(x) / sigmoid(self.t), dim = 1)
 
-        _, _, loss = self.pool(x = x, s = s)
+        # the pool gets the features stored in fit, so NeuromapD's dropout does not reach x_pooled
+        _, _, loss = self.pool(x = self.pool_x, s = s)
 
         return loss, s
 
@@ -377,7 +379,10 @@ class Neuromap(Cluster):
            ):
         self.data = data.to(device = self.device)
         self.pool = MapEquationPooling(adj = self.data.edge_index)
-        
+
+        # store sparse features in CSC format for the pool; then x.t() is x^T in CSR format, without a copy
+        self.pool_x = self.data.x.coalesce().to_sparse_csc() if self.data.x.is_sparse else self.data.x
+
         return super().fit(data = data, epochs = epochs, patience = patience, lrs = lrs, lr_schedule = lr_schedule, num_trials = num_trials, verbose = verbose)
 
 

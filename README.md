@@ -57,7 +57,8 @@ class MapEquationPooling(torch.nn.Module):
                    - self.p_log_p \
                    + torch.sum(p_m    * torch.log2(p_m.clamp_min(1e-30)))
 
-        x_pooled   = torch.matmul(s.T, x)
+        # multiply x^T @ s first, for the same reason as F @ s above; for x in CSC format, x.t() is in CSR format
+        x_pooled   = (x.t() @ s).t()
         # multiply adj @ s first, for the same reason as F @ s above
         adj_pooled = s.T @ (self.adj @ s)
 
