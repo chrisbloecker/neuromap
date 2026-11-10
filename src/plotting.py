@@ -12,6 +12,9 @@ def plot_overlapping(G, S, eps = 1e-3, pos = None, figsize = (5,5), node_scale =
     A = torch.tensor(nx.adjacency_matrix(G, nodelist = sorted(G.nodes)).todense(), dtype=torch.float)
     p = torch.sum(A, dim = 1) / torch.sum(A)
 
+    # S can be on the GPU, but .numpy() needs it on the CPU
+    S = S.cpu()
+
     existing_modules = []
 
     for module_ix, total_assignments in enumerate(torch.sum(S,0).numpy()):
