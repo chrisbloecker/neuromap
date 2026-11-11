@@ -6,7 +6,7 @@ The paper adapts the map equation, an information-theoretic objective function f
 The map equation is an information-theoretic objective function for community detection in complex networks.
 The map equation adopts a compression perspective and quantifies how efficiently a random walk on a network can be described based on the given communities.
 Those communities that lead to the best compression are considered to describe the organisational structure of the network well.
-The map equation's basic principles are described in the paper; more detailed explanations can be found in [Community Detection with the Map Equation and Infomap: Theory and Applications](https://arxiv.org/abs/2311.04036).
+The map equation's basic principles are described in the paper; more detailed explanations can be found in [Community Detection with the Map Equation and Infomap: Theory and Applications](https://doi.org/10.1145/3779648).
 
 The basic principle goes like this: (1) split the network into communities; (2) assign codewords to the nodes that are unique within each community, for example using Huffman codes; (3) compute how many bits are required per step that a random walker takes on the network -- this is the so-called codelength. The lower the codelength, the better the partition from step (1).
 **In practice** no codewords or random walks are used, instead, the map equation computes the codelength analytically.
@@ -80,11 +80,16 @@ Or perhaps you are just interested in looking at the plots of the results, which
 ## Citation
 If you're using Neuromap, please cite
 ```bibtext
-@inproceedings{blocker2024mapequationgoesneural,
-  title={The Map Equation Goes Neural: Mapping Network Flows with Graph Neural Networks},
-  author={Christopher Bl{\"o}cker and Chester Tan and Ingo Scholtes},
-  booktitle={The Thirty-eighth Annual Conference on Neural Information Processing Systems},
-  year={2024},
-  url={https://openreview.net/forum?id=aFWx1N84Fe}
+@inproceedings{NEURIPS2024_1f59562c,
+ author = {Bl\"{o}cker, Christopher and Tan, Chester and Scholtes, Ingo},
+ booktitle = {Advances in Neural Information Processing Systems},
+ doi = {10.52202/079017-0554},
+ editor = {A. Globerson and L. Mackey and D. Belgrave and A. Fan and U. Paquet and J. Tomczak and C. Zhang},
+ pages = {17428--17456},
+ publisher = {Curran Associates, Inc.},
+ title = {The Map Equation Goes Neural: Mapping Network Flows with Graph Neural Networks},
+ url = {https://proceedings.neurips.cc/paper_files/paper/2024/file/1f59562caae05e6aae0ffd1145bea5da-Paper-Conference.pdf},
+ volume = {37},
+ year = {2024}
 }
 ```
