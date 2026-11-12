@@ -1,7 +1,8 @@
-infomap==2.7.1
-networkx==3.2.1
-numpy==1.25.2
-matplotlib==3.7.3
-seaborn==0.12.2
-scikit-learn==1.3.0
-git+https://github.com/shchur/overlapping-community-detection.git
+infomap==2.15.1
+networkx==3.6.1
+numpy==2.5.4
+pandas==3.1.1
+matplotlib==3.11.2
+seaborn==0.13.2
+scikit-learn==1.9.1
+git+https://github.com/shchur/overlapping-community-detection.git@414856fd0d8f61d5bbeec06deb60c3e7b477a342
