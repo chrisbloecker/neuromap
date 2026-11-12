@@ -414,7 +414,12 @@ class NeuromapD(Neuromap):
                         )
     
     def forward(self, x):
-        x = torch.nn.functional.dropout(x, p = self.dropout, training = self.training)
+        # dropout does not support sparse tensors, so drop the stored entries of a sparse x
+        # dropout leaves zeros at zero, so this is the same as dropout on the dense x
+        if x.is_sparse:
+            x = torch.sparse_coo_tensor(x.indices(), torch.nn.functional.dropout(x.values(), p = self.dropout, training = self.training), x.shape)
+        else:
+            x = torch.nn.functional.dropout(x, p = self.dropout, training = self.training)
         return super().forward(x)
 
 
