@@ -71,17 +71,18 @@ class MapEquationPooling(torch.nn.Module):
         # subtracting the diagonal from the row sums would round a flow of 1e-8 next to a flow near 1 to 0
         C_between = C - torch.diag(torch.diag(C))
 
-        q      = torch.sum(C_between)
-        q_m    = torch.sum(C_between, dim = 1)
-        m_exit = torch.sum(C_between, dim = 0)
-        p_m    = q_m + torch.sum(C, dim = 0)
+        # the row sums of C_between are the flows out of each module, the column sums the flows into it
+        q       = torch.sum(C_between)
+        q_m     = torch.sum(C_between, dim = 1)
+        m_enter = torch.sum(C_between, dim = 0)
+        p_m     = q_m + torch.sum(C, dim = 0)
 
         # clamp the input to log2, so that a flow of 0 gets a finite gradient instead of 0/0
-        codelength = torch.sum(q      * torch.log2(q.clamp_min(1e-30))) \
-                   - torch.sum(q_m    * torch.log2(q_m.clamp_min(1e-30))) \
-                   - torch.sum(m_exit * torch.log2(m_exit.clamp_min(1e-30))) \
+        codelength = torch.sum(q       * torch.log2(q.clamp_min(1e-30))) \
+                   - torch.sum(q_m     * torch.log2(q_m.clamp_min(1e-30))) \
+                   - torch.sum(m_enter * torch.log2(m_enter.clamp_min(1e-30))) \
                    - self.p_log_p \
-                   + torch.sum(p_m    * torch.log2(p_m.clamp_min(1e-30)))
+                   + torch.sum(p_m     * torch.log2(p_m.clamp_min(1e-30)))
 
         # multiply x^T @ s first, for the same reason as F @ s above; for x in CSC format, x.t() is in CSR format
         x_pooled   = (x.t() @ s).t()
