@@ -21,6 +21,9 @@ def mkSmartTeleportationFlow(A, alpha = 0.15, iter = 1000):
     # build the transition matrix
     T = torch.nan_to_num(A.T * (torch.sum(A, 1)**(-1.0)).to_dense(), nan = 0.0).T
 
+    # nodes without out-links have an all-zero row in T, so a walker on them teleports with probability 1
+    dangling = torch.sum(A, 1).to_dense() == 0
+
     # distribution according to nodes' in-degrees
     e_v = (torch.sum(A, dim = 0) / torch.sum(A)).to_dense()
 
@@ -32,7 +35,7 @@ def mkSmartTeleportationFlow(A, alpha = 0.15, iter = 1000):
     e   = e_v.to(dtype = torch.float64)
     p   = e
     for _ in range(iter):
-        p_next = alpha * e + (1-alpha) * (T_T @ p)
+        p_next = (alpha + (1-alpha) * torch.sum(p[dangling])) * e + (1-alpha) * (T_T @ p)
         change = torch.sum(torch.abs(p_next - p))
         p      = p_next
         if change < 1e-15:
@@ -40,9 +43,10 @@ def mkSmartTeleportationFlow(A, alpha = 0.15, iter = 1000):
     p = p.to(dtype = A.dtype)
 
     # make the flow matrix for minimising the map equation
+    # teleporting walkers, including those on nodes without out-links, follow a link chosen in proportion to its weight
     # the sum of the two terms stores every entry twice, so coalesce it
     # store F in CSR format; a product with a COO matrix converts it to CSR on every call
-    F = (alpha * A / torch.sum(A) + (1-alpha) * (p * T.T).T).coalesce().to_sparse_csr()
+    F = ((alpha + (1-alpha) * torch.sum(p[dangling])) * A / torch.sum(A) + (1-alpha) * (p * T.T).T).coalesce().to_sparse_csr()
 
     return F, p
 
