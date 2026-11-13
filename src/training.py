@@ -254,7 +254,8 @@ class Cluster(torch.nn.Module):
         x = self.data.x
         if self.use_model in ["gin", "sage"]:
             x = x.to_dense()
-        if self.use_model in ["lin", "mlp", "gcn"] and self._get_name() in ["DiffPool", "MinCut", "Ortho"]:
+        # DiffPool, MinCut and Ortho pool x with dense products, whatever the model
+        if self._get_name() in ["DiffPool", "MinCut", "Ortho"]:
             x = x.to_dense()
         # store sparse features in CSR format; a product with a COO matrix converts it to CSR on every call
         if x.is_sparse:
