@@ -158,6 +158,10 @@ class Cluster(torch.nn.Module):
         Resets the clusterer by creating an fresh model.
         """
 
+        # PyG's conv layers read a sparse edge_index as the transposed adjacency, with one row per target node
+        # data.edge_index is A[source, target], so pass its transpose to send messages from source to target
+        adj_t = self.data.edge_index.t().coalesce()
+
         if self.use_model == "lin":
             self.model = Linear( in_channels  = self.in_channels
                                , out_channels = self.out_channels
@@ -182,7 +186,7 @@ class Cluster(torch.nn.Module):
                             , act             = self.act
                             , norm            = self.norm
                             , dropout         = self.dropout
-                            , edge_index      = self.data.edge_index
+                            , edge_index      = adj_t
                             )
             
         elif self.use_model == "gin":
@@ -193,7 +197,7 @@ class Cluster(torch.nn.Module):
                             , act             = self.act
                             , norm            = self.norm
                             , dropout         = self.dropout
-                            , edge_index      = self.data.edge_index
+                            , edge_index      = adj_t
                             )
         
         elif self.use_model == "gat":
@@ -204,7 +208,7 @@ class Cluster(torch.nn.Module):
                             , act             = self.act
                             , norm            = self.norm
                             , dropout         = self.dropout
-                            , edge_index      = self.data.edge_index
+                            , edge_index      = adj_t
                             )
         
         elif self.use_model == "sage":
@@ -215,7 +219,7 @@ class Cluster(torch.nn.Module):
                              , act             = self.act
                              , norm            = self.norm
                              , dropout         = self.dropout
-                             , edge_index      = self.data.edge_index
+                             , edge_index      = adj_t
                              )
         
         self.model = self.model.to(self.device)
