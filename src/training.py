@@ -248,6 +248,9 @@ class Cluster(torch.nn.Module):
             x = x.to_dense()
         if self.use_model in ["lin", "mlp", "gcn"] and self._get_name() in ["DiffPool", "MinCut", "Ortho"]:
             x = x.to_dense()
+        # store sparse features in CSR format; a product with a COO matrix converts it to CSR on every call
+        if x.is_sparse:
+            x = x.coalesce().to_sparse_csr()
 
         for lr in lrs:
             trial  = 0
@@ -416,8 +419,8 @@ class NeuromapD(Neuromap):
     def forward(self, x):
         # dropout does not support sparse tensors, so drop the stored entries of a sparse x
         # dropout leaves zeros at zero, so this is the same as dropout on the dense x
-        if x.is_sparse:
-            x = torch.sparse_coo_tensor(x.indices(), torch.nn.functional.dropout(x.values(), p = self.dropout, training = self.training), x.shape)
+        if x.layout == torch.sparse_csr:
+            x = torch.sparse_csr_tensor(x.crow_indices(), x.col_indices(), torch.nn.functional.dropout(x.values(), p = self.dropout, training = self.training), x.shape)
         else:
             x = torch.nn.functional.dropout(x, p = self.dropout, training = self.training)
         return super().forward(x)
