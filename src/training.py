@@ -634,5 +634,6 @@ class NOCD(Cluster):
            ):
         self.data = data.to(device = self.device)
         self.A = to_scipy_sparse_matrix(edge_index = data.edge_index.indices(), edge_attr = data.edge_index.values())
-        self.nocd_decoder = nocd.nn.BerpoDecoder(self.data.num_nodes, self.data.num_edges, balance_loss=True)
+        # data.num_edges assumes edge_index has shape [2, num_edges]; here it is the sparse adjacency, so count its stored entries
+        self.nocd_decoder = nocd.nn.BerpoDecoder(self.data.num_nodes, self.A.nnz, balance_loss=True)
         return super().fit(data = data, epochs = epochs, patience = patience, lrs = lrs, lr_schedule = lr_schedule, num_trials = num_trials, verbose = verbose)
