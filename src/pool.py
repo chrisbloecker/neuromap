@@ -11,79 +11,8 @@ from torch_geometric.typing import OptTensor, SparseTensor
 from torch_geometric.nn.models.mlp import MLP
 
 
-def smart_teleport(A, alpha=0.15, iter=1000):
-    # build the transition matrix
-    T = torch.nan_to_num(A.T * torch.sum(A, 1).to_dense() ** (-1), nan=0.0).T.to(
-        device=A.device
-    )
-
-    # distribution according to nodes' in-degrees
-    e_v = (torch.sum(A, dim=0) / torch.sum(A)).to_dense().to(device=A.device)
-
-    # calculate the flow distribution with a power iteration
-    # p = (1/len(T) * torch.ones(len(T))).to(device = device)
-    p = e_v
-    for _ in range(iter):
-        p = alpha * e_v + (1 - alpha) * p @ T
-
-    # make the flow matrix for minimising the map equation
-    F = alpha * A / torch.sum(A) + (1 - alpha) * (p * T.T).T
-
-    return F, p
-
-
-class NeuromapPooling(torch.nn.Module):
-    r"""This criterion computes the map equation codelength for an undirected or directed weighted graph.
-
-    Args:
-        A (torch.Tensor): (Unnormalized) Adjacency matrix of the weighted graph.
-        epsilon (float, optional): Small epsilon to ensure differentiability of logs.
-
-    """
-
-    def __init__(
-        self,
-        adj: Tensor,
-        epsilon: float = 1e-8,
-    ):
-        super().__init__()
-
-        self.epsilon = epsilon
-        self.F, self.p = smart_teleport(adj)
-
-    def forward(
-        self,
-        x: Tensor,
-        s: Tensor,
-        eps: float = 1e-8,
-    ):
-        s = s + eps
-
-        out_adj = s.T @ self.F @ s
-
-        diag = torch.sparse_coo_tensor(
-            indices=[range(len(out_adj)), range(len(out_adj))],
-            values=torch.diag(out_adj),
-            size=out_adj.shape,
-        ).to(device=s.device)
-
-        e1 = torch.sum(out_adj) - torch.trace(out_adj)
-        e2 = torch.sum(out_adj - diag, 1)
-        e3 = self.p
-        e4 = torch.sum(out_adj, 1) + torch.sum(out_adj.T - diag, 1)
-
-        e1 = torch.sum(e1 * torch.nan_to_num(torch.log2(e1), nan=0.0))
-        e2 = torch.sum(e2 * torch.nan_to_num(torch.log2(e2), nan=0.0))
-        e3 = torch.sum(e3 * torch.nan_to_num(torch.log2(e3), nan=0.0))
-        e4 = torch.sum(e4 * torch.nan_to_num(torch.log2(e4), nan=0.0))
-
-        map_equation_loss = e1 - 2 * e2 - e3 + e4
-
-        out = torch.matmul(s.T, x)
-
-        return out, out_adj, map_equation_loss
-
-
+# diff_pool, mincut_pool and DMoNPooling are dense_diff_pool, dense_mincut_pool and DMoNPooling from PyG 2.8.1
+# they are changed only where adj is a sparse matrix; each changed line has PyG's version as a comment above it
 def diff_pool(
     x: Tensor,
     adj: Tensor,
@@ -351,7 +280,7 @@ class DMoNPooling(torch.nn.Module):
         if isinstance(channels, int):
             channels = [channels]
 
-        self.mlp = MLP(channels + [k], act="selu", norm=None)
+        self.mlp = MLP(channels + [k], act=None, norm=None)
 
         self.dropout = dropout
 
@@ -393,11 +322,13 @@ class DMoNPooling(torch.nn.Module):
         s = F.dropout(s, self.dropout, training=self.training)
         s = torch.softmax(s, dim=-1)
 
-        (batch_size, num_nodes, _), k = x.size(), s.size(-1)
+        (batch_size, num_nodes, _), C = x.size(), s.size(-1)
 
-        if mask is not None:
-            mask = mask.view(batch_size, num_nodes, 1).to(x.dtype)
-            x, s = x * mask, s * mask
+        if mask is None:
+            mask = torch.ones(batch_size, num_nodes, dtype=torch.bool, device=x.device)
+
+        mask = mask.view(batch_size, num_nodes, 1).to(x.dtype)
+        x, s = x * mask, s * mask
 
         out = F.selu(torch.matmul(s.transpose(1, 2), x))
         # out_adj = torch.matmul(torch.matmul(s.transpose(1, 2), adj), s)
@@ -405,34 +336,39 @@ class DMoNPooling(torch.nn.Module):
         out_adj = out_adj[None, :, :]
 
         # Spectral loss:
-        degrees = torch.einsum("ijk->ik", adj).transpose(0, 1)
-        m = torch.einsum("ij->", degrees)
+        # degrees = torch.einsum("ijk->ij", adj)  # B X N
+        degrees = torch.einsum("ijk->ij", adj).to_dense()  # B X N
+        degrees = degrees.unsqueeze(-1) * mask  # B x N x 1
+        degrees_t = degrees.transpose(1, 2)  # B x 1 x N
 
-        # ca = torch.matmul(s.transpose(1, 2), degrees)
-        ca = torch.matmul(s[0].T, degrees).unsqueeze(0)
-        cb = torch.matmul(degrees.T, s[0]).unsqueeze(0)
+        m = torch.einsum("ijk->i", degrees) / 2  # B
+        m_expand = m.view(-1, 1, 1).expand(-1, C, C)  # B x C x C
 
-        normalizer = torch.matmul(ca, cb) / 2 / m
+        ca = torch.matmul(s.transpose(1, 2), degrees)  # B x C x 1
+        cb = torch.matmul(degrees_t, s)  # B x 1 x C
+
+        normalizer = torch.matmul(ca, cb) / 2 / m_expand
         decompose = out_adj - normalizer
         spectral_loss = -_rank3_trace(decompose) / 2 / m
-        spectral_loss = torch.mean(spectral_loss)
+        spectral_loss = spectral_loss.mean()
 
         # Orthogonality regularization:
         ss = torch.matmul(s.transpose(1, 2), s)
-        i_s = torch.eye(k).type_as(ss)
+        i_s = torch.eye(C).type_as(ss)
         ortho_loss = torch.norm(
             ss / torch.norm(ss, dim=(-1, -2), keepdim=True) - i_s / torch.norm(i_s),
             dim=(-1, -2),
         )
-        ortho_loss = torch.mean(ortho_loss)
+        ortho_loss = ortho_loss.mean()
 
         # Cluster loss:
-        cluster_loss = (
-            torch.norm(torch.einsum("ijk->ij", ss)) / adj.size(1) * torch.norm(i_s) - 1
-        )
+        cluster_size = torch.einsum("ijk->ik", s)  # B x C
+        cluster_loss = torch.norm(input=cluster_size, dim=1)
+        cluster_loss = cluster_loss / mask.sum(dim=1) * torch.norm(i_s) - 1
+        cluster_loss = cluster_loss.mean()
 
         # Fix and normalize coarsened adjacency matrix:
-        ind = torch.arange(k, device=out_adj.device)
+        ind = torch.arange(C, device=out_adj.device)
         out_adj[:, ind, ind] = 0
         d = torch.einsum("ijk->ij", out_adj)
         d = torch.sqrt(d)[:, None] + EPS

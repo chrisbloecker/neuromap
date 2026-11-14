@@ -280,7 +280,8 @@ def to_dataset(G : nx.Graph, y_true : List[int]) -> Data:
 def get_codelength(G, y, directed = False) -> float:
     """
     """
-    im = Infomap(silent = True, two_level = True, no_infomap = True, recorded_teleportation = directed)
+    # Infomap's default flow on directed networks does not record teleportation steps, like Neuromap's loss
+    im = Infomap(silent = True, two_level = True, no_infomap = True, directed = directed)
     im.add_networkx_graph(G)
     im.initial_partition = dict(enumerate(y, start = 1))
     im.run()

@@ -18,7 +18,7 @@ class LinearModel(torch.nn.Module):
         self.dropout = dropout
     
     def forward(self, x):
-        return F.dropout(self.lin(x), training = self.training)
+        return F.dropout(self.lin(x), p = self.dropout, training = self.training)
 
 
 class MLPModel(torch.nn.Module):
