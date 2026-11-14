@@ -165,7 +165,8 @@ class Cluster(torch.nn.Module):
 
         # PyG's conv layers read a sparse edge_index as the transposed adjacency, with one row per target node
         # data.edge_index is A[source, target], so pass its transpose to send messages from source to target
-        adj_t = self.data.edge_index.t().coalesce()
+        # store it in CSR format; a product with a COO matrix converts it to CSR on every call
+        adj_t = self.data.edge_index.t().coalesce().to_sparse_csr()
 
         if self.use_model == "lin":
             self.model = Linear( in_channels  = self.in_channels
