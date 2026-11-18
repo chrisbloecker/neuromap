@@ -153,8 +153,7 @@ def diff_pool(
 
     out = torch.matmul(s.transpose(1, 2), x)
     # out_adj = torch.matmul(torch.matmul(s.transpose(1, 2), adj), s)
-    out_adj = torch.sparse.mm(adj[0], s[0]).T
-    out_adj = torch.sparse.mm(out_adj, s[0])
+    out_adj = s[0].T @ torch.sparse.mm(adj[0], s[0])
     out_adj = out_adj[None, :, :]
 
     # link_loss = adj - torch.matmul(s, s.transpose(1, 2))
@@ -241,8 +240,7 @@ def mincut_pool(
 
     out = torch.matmul(s.transpose(1, 2), x)
     # out_adj = torch.matmul(torch.matmul(s.transpose(1, 2), adj), s)
-    out_adj = torch.sparse.mm(adj[0], s[0]).T
-    out_adj = torch.sparse.mm(out_adj, s[0])
+    out_adj = s[0].T @ torch.sparse.mm(adj[0], s[0])
     out_adj = out_adj[None, :, :]
 
     # MinCut regularization.
@@ -403,8 +401,7 @@ class DMoNPooling(torch.nn.Module):
 
         out = F.selu(torch.matmul(s.transpose(1, 2), x))
         # out_adj = torch.matmul(torch.matmul(s.transpose(1, 2), adj), s)
-        out_adj = torch.sparse.mm(adj[0], s[0]).T
-        out_adj = torch.sparse.mm(out_adj, s[0])
+        out_adj = s[0].T @ torch.sparse.mm(adj[0], s[0])
         out_adj = out_adj[None, :, :]
 
         # Spectral loss:

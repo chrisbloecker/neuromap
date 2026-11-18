@@ -21,6 +21,9 @@ def mkSmartTeleportationFlow(A, alpha = 0.15, iter = 1000):
     # build the transition matrix
     T = torch.nan_to_num(A.T * (torch.sum(A, 1)**(-1.0)).to_dense(), nan = 0.0).T
 
+    # nodes without out-links have an all-zero row in T, so a walker on them teleports with probability 1
+    dangling = torch.sum(A, 1).to_dense() == 0
+
     # distribution according to nodes' in-degrees
     e_v = (torch.sum(A, dim = 0) / torch.sum(A)).to_dense()
 
@@ -32,7 +35,7 @@ def mkSmartTeleportationFlow(A, alpha = 0.15, iter = 1000):
     e   = e_v.to(dtype = torch.float64)
     p   = e
     for _ in range(iter):
-        p_next = alpha * e + (1-alpha) * (T_T @ p)
+        p_next = (alpha + (1-alpha) * torch.sum(p[dangling])) * e + (1-alpha) * (T_T @ p)
         change = torch.sum(torch.abs(p_next - p))
         p      = p_next
         if change < 1e-15:
@@ -40,9 +43,10 @@ def mkSmartTeleportationFlow(A, alpha = 0.15, iter = 1000):
     p = p.to(dtype = A.dtype)
 
     # make the flow matrix for minimising the map equation
+    # teleporting walkers, including those on nodes without out-links, follow a link chosen in proportion to its weight
     # the sum of the two terms stores every entry twice, so coalesce it
     # store F in CSR format; a product with a COO matrix converts it to CSR on every call
-    F = (alpha * A / torch.sum(A) + (1-alpha) * (p * T.T).T).coalesce().to_sparse_csr()
+    F = ((alpha + (1-alpha) * torch.sum(p[dangling])) * A / torch.sum(A) + (1-alpha) * (p * T.T).T).coalesce().to_sparse_csr()
 
     return F, p
 
@@ -67,17 +71,18 @@ class MapEquationPooling(torch.nn.Module):
         # subtracting the diagonal from the row sums would round a flow of 1e-8 next to a flow near 1 to 0
         C_between = C - torch.diag(torch.diag(C))
 
-        q      = torch.sum(C_between)
-        q_m    = torch.sum(C_between, dim = 1)
-        m_exit = torch.sum(C_between, dim = 0)
-        p_m    = q_m + torch.sum(C, dim = 0)
+        # the row sums of C_between are the flows out of each module, the column sums the flows into it
+        q       = torch.sum(C_between)
+        q_m     = torch.sum(C_between, dim = 1)
+        m_enter = torch.sum(C_between, dim = 0)
+        p_m     = q_m + torch.sum(C, dim = 0)
 
         # clamp the input to log2, so that a flow of 0 gets a finite gradient instead of 0/0
-        codelength = torch.sum(q      * torch.log2(q.clamp_min(1e-30))) \
-                   - torch.sum(q_m    * torch.log2(q_m.clamp_min(1e-30))) \
-                   - torch.sum(m_exit * torch.log2(m_exit.clamp_min(1e-30))) \
+        codelength = torch.sum(q       * torch.log2(q.clamp_min(1e-30))) \
+                   - torch.sum(q_m     * torch.log2(q_m.clamp_min(1e-30))) \
+                   - torch.sum(m_enter * torch.log2(m_enter.clamp_min(1e-30))) \
                    - self.p_log_p \
-                   + torch.sum(p_m    * torch.log2(p_m.clamp_min(1e-30)))
+                   + torch.sum(p_m     * torch.log2(p_m.clamp_min(1e-30)))
 
         # multiply x^T @ s first, for the same reason as F @ s above; for x in CSC format, x.t() is in CSR format
         x_pooled   = (x.t() @ s).t()
@@ -158,6 +163,10 @@ class Cluster(torch.nn.Module):
         Resets the clusterer by creating an fresh model.
         """
 
+        # PyG's conv layers read a sparse edge_index as the transposed adjacency, with one row per target node
+        # data.edge_index is A[source, target], so pass its transpose to send messages from source to target
+        adj_t = self.data.edge_index.t().coalesce()
+
         if self.use_model == "lin":
             self.model = Linear( in_channels  = self.in_channels
                                , out_channels = self.out_channels
@@ -182,7 +191,7 @@ class Cluster(torch.nn.Module):
                             , act             = self.act
                             , norm            = self.norm
                             , dropout         = self.dropout
-                            , edge_index      = self.data.edge_index
+                            , edge_index      = adj_t
                             )
             
         elif self.use_model == "gin":
@@ -193,7 +202,7 @@ class Cluster(torch.nn.Module):
                             , act             = self.act
                             , norm            = self.norm
                             , dropout         = self.dropout
-                            , edge_index      = self.data.edge_index
+                            , edge_index      = adj_t
                             )
         
         elif self.use_model == "gat":
@@ -204,7 +213,7 @@ class Cluster(torch.nn.Module):
                             , act             = self.act
                             , norm            = self.norm
                             , dropout         = self.dropout
-                            , edge_index      = self.data.edge_index
+                            , edge_index      = adj_t
                             )
         
         elif self.use_model == "sage":
@@ -215,7 +224,7 @@ class Cluster(torch.nn.Module):
                              , act             = self.act
                              , norm            = self.norm
                              , dropout         = self.dropout
-                             , edge_index      = self.data.edge_index
+                             , edge_index      = adj_t
                              )
         
         self.model = self.model.to(self.device)
@@ -246,8 +255,12 @@ class Cluster(torch.nn.Module):
         x = self.data.x
         if self.use_model in ["gin", "sage"]:
             x = x.to_dense()
-        if self.use_model in ["lin", "mlp", "gcn"] and self._get_name() in ["DiffPool", "MinCut", "Ortho"]:
+        # DiffPool, MinCut and Ortho pool x with dense products, whatever the model
+        if self._get_name() in ["DiffPool", "MinCut", "Ortho"]:
             x = x.to_dense()
+        # store sparse features in CSR format; a product with a COO matrix converts it to CSR on every call
+        if x.is_sparse:
+            x = x.coalesce().to_sparse_csr()
 
         for lr in lrs:
             trial  = 0
@@ -416,8 +429,8 @@ class NeuromapD(Neuromap):
     def forward(self, x):
         # dropout does not support sparse tensors, so drop the stored entries of a sparse x
         # dropout leaves zeros at zero, so this is the same as dropout on the dense x
-        if x.is_sparse:
-            x = torch.sparse_coo_tensor(x.indices(), torch.nn.functional.dropout(x.values(), p = self.dropout, training = self.training), x.shape)
+        if x.layout == torch.sparse_csr:
+            x = torch.sparse_csr_tensor(x.crow_indices(), x.col_indices(), torch.nn.functional.dropout(x.values(), p = self.dropout, training = self.training), x.shape)
         else:
             x = torch.nn.functional.dropout(x, p = self.dropout, training = self.training)
         return super().forward(x)
@@ -631,5 +644,6 @@ class NOCD(Cluster):
            ):
         self.data = data.to(device = self.device)
         self.A = to_scipy_sparse_matrix(edge_index = data.edge_index.indices(), edge_attr = data.edge_index.values())
-        self.nocd_decoder = nocd.nn.BerpoDecoder(self.data.num_nodes, self.data.num_edges, balance_loss=True)
+        # data.num_edges assumes edge_index has shape [2, num_edges]; here it is the sparse adjacency, so count its stored entries
+        self.nocd_decoder = nocd.nn.BerpoDecoder(self.data.num_nodes, self.A.nnz, balance_loss=True)
         return super().fit(data = data, epochs = epochs, patience = patience, lrs = lrs, lr_schedule = lr_schedule, num_trials = num_trials, verbose = verbose)
