@@ -271,8 +271,10 @@ class Cluster(torch.nn.Module):
                     # reset the model
                     self._reset()
 
-                    l_best : float  = inf  # best loss
-                    s_best : Tensor = None # best cluster
+                    l_best  : float  = inf  # best loss
+                    s_best  : Tensor = None # best cluster
+                    l_ref   : float  = inf  # best loss when patience was last reset
+                    l_start : float  = None # loss at epoch 10, where the drop that scales the tolerance starts
 
                     optimizer = torch.optim.Adam(self.parameters(), lr = lr)
                     if lr_schedule:
@@ -307,9 +309,19 @@ class Cluster(torch.nn.Module):
                                 break
 
                             if loss < l_best:
-                                l_best         = float(loss)
+                                l_best = float(loss)
+                                s_best = s
+
+                            # reset patience only when the loss is lower than at the last reset by more than 1e-4 of its drop since epoch 10, and on any decrease before that
+                            # measured against that drop, the tolerance does not depend on the units or the offset of a method's loss
+                            # the drop starts at epoch 10 because some losses spike in the first epochs, such as NOCD's with a linear model, which starts near 30
+                            # a loss that keeps dropping by tiny amounts, such as a codelength while the softmax sharpens, would otherwise reset patience for thousands of epochs
+                            if epoch == 10:
+                                l_start = float(loss)
+                            tolerance = 1e-4 * (l_start - l_ref) if epoch >= 10 else 0
+                            if loss < l_ref - tolerance:
+                                l_ref          = float(loss)
                                 no_improvement = 0
-                                s_best         = s
                             else:
                                 no_improvement += 1
 
