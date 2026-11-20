@@ -316,6 +316,8 @@ class Cluster(torch.nn.Module):
         self.batches = order.split(batch_size)
         # the row of each node in the batches' outputs, put together in order
         self.positions = torch.argsort(order)
+        # each batch's subgraph, built when it is first needed, by _batch_subgraph
+        self.subgraphs = {}
 
         # store sparse features in CSR format, whose rows csr_rows takes
         x = self.data.x.cpu()
@@ -353,18 +355,32 @@ class Cluster(torch.nn.Module):
         row = torch.repeat_interleave(torch.arange(num_rows, device = self.device), rows.crow_indices().diff())
         return torch.sparse_coo_tensor(torch.stack([row, local[rows.col_indices()]]), rows.values(), (num_rows, len(n_id))).coalesce().to_sparse_csr()
 
-    def _encode_batch(self, x: Tensor, seeds: Tensor) -> Tensor:
+    def _batch_subgraph(self, b: int) -> Tuple[Tensor, List[int], Maybe[Tensor]]:
         """
-        The model's output for one batch's nodes, computed on the subgraph of the nodes whose features reach them.
+        Batch b's subgraph: its nodes, ordered by hops from the batch; the number of them within 0, 1, ..., L hops; and the adjacency matrix from them to the nodes within L - 1 hops.
+        Every pass and every trial of a fit uses the same subgraphs, so they are built once and kept in CPU memory.
+        Building them took about 80% of a forward pass on PubMed.
+        """
+        if b not in self.subgraphs:
+            seeds = self.batches[b]
+            if self.use_model in ["lin", "mlp"]:
+                self.subgraphs[b] = (seeds.cpu(), [len(seeds)], None)
+            else:
+                n_id, counts = self._neighbourhood(seeds)
+                self.subgraphs[b] = (n_id.cpu(), counts, self._subgraph(n_id, counts[self.num_layers - 1]).cpu())
+        return self.subgraphs[b]
+
+    def _encode_batch(self, x: Tensor, b: int) -> Tensor:
+        """
+        The model's output for batch b's nodes, computed on the subgraph of the nodes whose features reach them.
         Layer i of the model's L layers computes the nodes within L - i - 1 hops of the batch, from the nodes within L - i hops.
         Those are the rows that the next layer reads, and the last layer computes the batch's nodes.
         """
-        n_id, counts = (seeds, [len(seeds)]) if self.use_model in ["lin", "mlp"] else self._neighbourhood(seeds)
-        self.model.batch.start(n_id, len(seeds))
+        n_id, counts, adj = self._batch_subgraph(b)
+        self.model.batch.start(n_id.to(self.device), counts[0])
 
         # move the subgraph's features from CPU memory to the device
-        rows  = n_id.cpu()
-        x_sub = (csr_rows(x, rows) if x.layout == torch.sparse_csr else x[rows]).to(self.device)
+        x_sub = (csr_rows(x, n_id) if x.layout == torch.sparse_csr else x[n_id]).to(self.device)
         if self.use_model in ["gin", "sage"]:
             x_sub = x_sub.to_dense()
 
@@ -373,7 +389,7 @@ class Cluster(torch.nn.Module):
 
         # layer i's adjacency matrix: the first rows of the subgraph's, with a column for each node within L - i hops
         L    = self.num_layers
-        adj  = self._subgraph(n_id, counts[L - 1])
+        adj  = adj.to(self.device)
         adjs = [first_rows(adj, counts[L - i - 1], counts[L - i]) for i in range(L)]
         return self.encode(x_sub, adjs)
 
@@ -383,7 +399,7 @@ class Cluster(torch.nn.Module):
         """
         if self.batch_size is None:
             return self.encode(x)
-        return torch.cat([self._encode_batch(x, seeds) for seeds in self.batches])[self.positions]
+        return torch.cat([self._encode_batch(x, b) for b in range(len(self.batches))])[self.positions]
 
     def _collect_statistics(self, x: Tensor) -> List[NodeBatchNorm]:
         """
@@ -397,9 +413,9 @@ class Cluster(torch.nn.Module):
         order = []
         with torch.no_grad():
             while len(order) < len(norms):
-                for seeds in self.batches:
+                for b in range(len(self.batches)):
                     try:
-                        self._encode_batch(x, seeds)
+                        self._encode_batch(x, b)
                     except StopForward:
                         pass
                 # the first NodeBatchNorm without statistics collected them in this pass
@@ -415,9 +431,9 @@ class Cluster(torch.nn.Module):
         """
         for norm in reversed(norms):
             norm.backprop = True
-            for seeds in self.batches:
+            for b in range(len(self.batches)):
                 try:
-                    self._encode_batch(x, seeds)
+                    self._encode_batch(x, b)
                 except StopForward as stop:
                     stop.surrogate.backward()
             norm.backprop = False
@@ -451,8 +467,8 @@ class Cluster(torch.nn.Module):
         loss.backward()
 
         if self.batch_size is not None:
-            for seeds in self.batches:
-                self._encode_batch(x, seeds).backward(z.grad[seeds])
+            for b, seeds in enumerate(self.batches):
+                self._encode_batch(x, b).backward(z.grad[seeds])
             self._backprop_statistics(x, norms)
 
     def fit( self
