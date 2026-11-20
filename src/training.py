@@ -7,7 +7,6 @@ from numpy                 import inf
 from time                  import sleep
 from typing                import List, Optional as Maybe
 from torch                 import Tensor
-from torch_geometric.utils import to_scipy_sparse_matrix
 from torch_geometric.data  import Data
 from torch.nn.functional   import softmax, sigmoid, relu
 from torch.nn              import Parameter
@@ -646,9 +645,25 @@ class NOCD(Cluster):
     
     def forward(self, x):
         x = relu(self.model(x))
-        loss = self.nocd_decoder.loss_full(x, self.A)
+        loss = self._loss(x)
 
         return loss, x
+
+    def _loss(self, emb):
+        """
+        BerpoDecoder.loss_full, with the dot products of linked nodes' embeddings taken only at the links, by torch.sparse.sampled_addmm.
+        loss_full gathers both embeddings of every link, an E × K matrix, which is slow and takes E × K memory.
+        """
+        decoder = self.nocd_decoder
+        # e1, e2 = adj.nonzero()
+        # edge_dots = torch.sum(emb[e1] * emb[e2], dim=1)
+        edge_dots  = torch.sparse.sampled_addmm(self.adj, emb, emb.t(), beta = 0.0).values()
+        loss_edges = -torch.sum(torch.log(-torch.expm1(-decoder.eps - edge_dots)))
+
+        # the rest as in loss_full, whose neg_scale is 1, because fit sets balance_loss
+        correction    = torch.sum(emb * emb) + torch.sum(edge_dots)
+        loss_nonedges = torch.sum(emb @ torch.sum(emb, dim = 0, keepdim = True).t()) - correction
+        return (loss_edges / decoder.num_edges + loss_nonedges / decoder.num_nonedges) / 2
 
     def extra_regularisation(self) -> float:
         weight_decay = 1e-2    # strength of L2 regularization on GNN weights
@@ -664,7 +679,8 @@ class NOCD(Cluster):
            , verbose     : bool        = False
            ):
         self.data = data.to(device = self.device)
-        self.A = to_scipy_sparse_matrix(edge_index = data.edge_index.indices(), edge_attr = data.edge_index.values())
+        # the links in CSR format, at which _loss takes the dot products of the linked nodes' embeddings
+        self.adj = self.data.edge_index.coalesce().to_sparse_csr()
         # data.num_edges assumes edge_index has shape [2, num_edges]; here it is the sparse adjacency, so count its stored entries
-        self.nocd_decoder = nocd.nn.BerpoDecoder(self.data.num_nodes, self.A.nnz, balance_loss=True)
+        self.nocd_decoder = nocd.nn.BerpoDecoder(self.data.num_nodes, self.adj._nnz(), balance_loss=True)
         return super().fit(data = data, epochs = epochs, patience = patience, lrs = lrs, lr_schedule = lr_schedule, num_trials = num_trials, verbose = verbose)
