@@ -3,10 +3,12 @@ import nocd
 
 from abc                   import abstractmethod
 from model                 import LinearModel as Linear, MLPModel as MLP, GCNModel as GCN, GINModel as GIN, GATModel as GAT, SAGEModel as SAGE
-from model                 import NodeBatchNorm, StopForward, keyed_dropout
-from numpy                 import inf
+from model                 import NodeBatchNorm, StopForward, keyed_dropout, first_rows
+from numpy                 import inf, ones
+from scipy.sparse          import csr_matrix
+from scipy.sparse.csgraph  import reverse_cuthill_mckee
 from time                  import sleep
-from typing                import List, Optional as Maybe
+from typing                import List, Optional as Maybe, Tuple
 from torch                 import Tensor
 from torch_geometric.utils import to_scipy_sparse_matrix
 from torch_geometric.data  import Data
@@ -261,13 +263,13 @@ class Cluster(torch.nn.Module):
         
         self.model = self.model.to(self.device)
 
-    def encode(self, x, edge_index = None):
+    def encode(self, x, adjs = None):
         """
-        The model's output, on the whole graph, or in batched training, on a batch's subgraph.
+        The model's output, on the whole graph, or in batched training, on a batch's subgraph, with one adjacency matrix per layer.
         """
-        if edge_index is None:
+        if adjs is None:
             return self.model(x)
-        return self.model(x, edge_index)
+        return self.model(x, adjs)
 
     @abstractmethod
     def objective(self, x, z):
@@ -303,21 +305,32 @@ class Cluster(torch.nn.Module):
                 x = x.coalesce().to_sparse_csr()
             return x
 
-        self.data    = data.to(self.device, "edge_index")
-        self.batches = torch.arange(self.data.num_nodes, device = self.device).split(batch_size)
+        self.data = data.to(self.device, "edge_index")
+
+        # batches of nodes that are consecutive in reverse Cuthill–McKee order, which puts linked nodes close together
+        # then the nodes within a few hops of a batch are fewer, and fewer of them are also near other batches
+        # the order changes only an epoch's memory and time; the gradient is the same for any order, up to rounding
+        links        = self.data.edge_index.indices().cpu().numpy()
+        adj          = csr_matrix((ones(links.shape[1]), (links[0], links[1])), shape = (self.data.num_nodes, self.data.num_nodes))
+        order        = torch.as_tensor(reverse_cuthill_mckee(adj, symmetric_mode = False).copy(), dtype = torch.long, device = self.device)
+        self.batches = order.split(batch_size)
+        # the row of each node in the batches' outputs, put together in order
+        self.positions = torch.argsort(order)
 
         # store sparse features in CSR format, whose rows csr_rows takes
         x = self.data.x.cpu()
         return x.coalesce().to_sparse_csr() if x.is_sparse else x
 
-    def _neighbourhood(self, seeds: Tensor) -> Tensor:
+    def _neighbourhood(self, seeds: Tensor) -> Tuple[Tensor, List[int]]:
         """
-        The nodes whose features reach the seeds through the model's layers: the seeds first, then the nodes one hop away, and so on, one hop per layer.
+        The nodes whose features reach the seeds through the model's layers, ordered by hops from the seeds, one hop per layer.
+        Also returns the number of nodes within 0, 1, ..., L hops.
         """
         adj_t    = self.model.edge_index
         seen     = torch.zeros(adj_t.size(0), dtype = torch.bool, device = self.device)
         n_id     = seeds
         frontier = seeds
+        counts   = [len(seeds)]
         seen[seeds] = True
         for _ in range(self.num_layers):
             # row v of adj_t holds the nodes that send messages to v
@@ -325,28 +338,28 @@ class Cluster(torch.nn.Module):
             frontier       = torch.unique(neighbours[~seen[neighbours]])
             seen[frontier] = True
             n_id           = torch.cat([n_id, frontier])
-        return n_id
+            counts.append(len(n_id))
+        return n_id, counts
 
-    def _subgraph(self, n_id: Tensor) -> Tensor:
+    def _subgraph(self, n_id: Tensor, num_rows: int) -> Tensor:
         """
-        The model's adjacency matrix among the nodes n_id, in their order.
+        The rows of the model's adjacency matrix for the first num_rows nodes of n_id, with a column for each node of n_id, in n_id's order.
+        The first num_rows nodes are within L - 1 hops of the batch, so all of their neighbours are in n_id.
         """
-        rows  = csr_rows(self.model.edge_index, n_id)
+        rows  = csr_rows(self.model.edge_index, n_id[:num_rows])
         local = torch.full((self.model.edge_index.size(0),), -1, device = self.device)
         local[n_id] = torch.arange(len(n_id), device = self.device)
 
-        row  = torch.repeat_interleave(torch.arange(len(n_id), device = self.device), rows.crow_indices().diff())
-        col  = local[rows.col_indices()]
-        keep = col >= 0
-        return torch.sparse_coo_tensor(torch.stack([row[keep], col[keep]]), rows.values()[keep], (len(n_id), len(n_id))).coalesce().to_sparse_csr()
+        row = torch.repeat_interleave(torch.arange(num_rows, device = self.device), rows.crow_indices().diff())
+        return torch.sparse_coo_tensor(torch.stack([row, local[rows.col_indices()]]), rows.values(), (num_rows, len(n_id))).coalesce().to_sparse_csr()
 
     def _encode_batch(self, x: Tensor, seeds: Tensor) -> Tensor:
         """
         The model's output for one batch's nodes, computed on the subgraph of the nodes whose features reach them.
-        A node h hops from the batch lacks some of its links, but its state is still exact after the first L - h of the model's L layers.
-        So after all layers, the batch's nodes are exact, and only their rows are kept.
+        Layer i of the model's L layers computes the nodes within L - i - 1 hops of the batch, from the nodes within L - i hops.
+        Those are the rows that the next layer reads, and the last layer computes the batch's nodes.
         """
-        n_id = seeds if self.use_model in ["lin", "mlp"] else self._neighbourhood(seeds)
+        n_id, counts = (seeds, [len(seeds)]) if self.use_model in ["lin", "mlp"] else self._neighbourhood(seeds)
         self.model.batch.start(n_id, len(seeds))
 
         # move the subgraph's features from CPU memory to the device
@@ -357,7 +370,12 @@ class Cluster(torch.nn.Module):
 
         if self.use_model in ["lin", "mlp"]:
             return self.encode(x_sub)
-        return self.encode(x_sub, self._subgraph(n_id))[:len(seeds)]
+
+        # layer i's adjacency matrix: the first rows of the subgraph's, with a column for each node within L - i hops
+        L    = self.num_layers
+        adj  = self._subgraph(n_id, counts[L - 1])
+        adjs = [first_rows(adj, counts[L - i - 1], counts[L - i]) for i in range(L)]
+        return self.encode(x_sub, adjs)
 
     def _encode(self, x: Tensor) -> Tensor:
         """
@@ -365,7 +383,7 @@ class Cluster(torch.nn.Module):
         """
         if self.batch_size is None:
             return self.encode(x)
-        return torch.cat([self._encode_batch(x, seeds) for seeds in self.batches])
+        return torch.cat([self._encode_batch(x, seeds) for seeds in self.batches])[self.positions]
 
     def _collect_statistics(self, x: Tensor) -> List[NodeBatchNorm]:
         """
@@ -623,7 +641,7 @@ class NeuromapD(Neuromap):
                         , **kwargs
                         )
     
-    def encode(self, x, edge_index = None):
+    def encode(self, x, adjs = None):
         # dropout does not support sparse tensors, so drop the stored entries of a sparse x
         # dropout leaves zeros at zero, so this is the same as dropout on the dense x
         # in batched training, the masks are keyed by node and feature, so that a node's features get the same mask in every batch
@@ -639,7 +657,7 @@ class NeuromapD(Neuromap):
             x = keyed_dropout(x, self.dropout, batch, batch.n_id)
         else:
             x = torch.nn.functional.dropout(x, p = self.dropout, training = self.training)
-        return super().encode(x, edge_index)
+        return super().encode(x, adjs)
 
 
 class DMoN(Cluster):
@@ -866,11 +884,11 @@ class NOCD(Cluster):
         self.nocd_decoder = nocd.nn.BerpoDecoder(self.data.num_nodes, self.A.nnz, balance_loss=True)
 
         if batch_size is not None:
-            # chunks of the links whose source is in one batch; A stores its links sorted by source
+            # chunks of as many links as a batch's nodes have on average
             e1, e2  = self.A.nonzero()
             self.e1 = torch.as_tensor(e1, dtype = torch.long, device = self.device)
             self.e2 = torch.as_tensor(e2, dtype = torch.long, device = self.device)
-            bounds  = torch.searchsorted(self.e1, torch.tensor([int(seeds[0]) for seeds in self.batches] + [self.data.num_nodes], device = self.device)).tolist()
-            self.link_chunks = list(zip(bounds[:-1], bounds[1:]))
+            step    = -(-len(e1) // len(self.batches))
+            self.link_chunks = [(start, min(start + step, len(e1))) for start in range(0, len(e1), step)]
 
         return x
