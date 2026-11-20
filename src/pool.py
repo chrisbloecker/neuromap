@@ -12,7 +12,9 @@ from torch_geometric.nn.models.mlp import MLP
 
 
 # diff_pool, mincut_pool and DMoNPooling are dense_diff_pool, dense_mincut_pool and DMoNPooling from PyG 2.8.1
-# they are changed only where adj is a sparse matrix; each changed line has PyG's version as a comment above it
+# they are changed where adj is a sparse matrix
+# they make the identity matrix on the assignments' device instead of on the CPU
+# each changed line has PyG's version as a comment above it
 def diff_pool(
     x: Tensor,
     adj: Tensor,
@@ -185,7 +187,9 @@ def mincut_pool(
 
     # Orthogonality regularization.
     ss = torch.matmul(s.transpose(1, 2), s)
-    i_s = torch.eye(k).type_as(ss)
+    # i_s = torch.eye(k).type_as(ss)
+    # make the identity on ss's device, instead of on the CPU and copying it over in every call
+    i_s = torch.eye(k, dtype=ss.dtype, device=ss.device)
     ortho_loss = torch.norm(
         ss / torch.norm(ss, dim=(-1, -2), keepdim=True) - i_s / torch.norm(i_s),
         dim=(-1, -2),
@@ -354,7 +358,9 @@ class DMoNPooling(torch.nn.Module):
 
         # Orthogonality regularization:
         ss = torch.matmul(s.transpose(1, 2), s)
-        i_s = torch.eye(C).type_as(ss)
+        # i_s = torch.eye(C).type_as(ss)
+        # make the identity on ss's device, instead of on the CPU and copying it over in every call
+        i_s = torch.eye(C, dtype=ss.dtype, device=ss.device)
         ortho_loss = torch.norm(
             ss / torch.norm(ss, dim=(-1, -2), keepdim=True) - i_s / torch.norm(i_s),
             dim=(-1, -2),
