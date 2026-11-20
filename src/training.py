@@ -11,7 +11,7 @@ from torch_geometric.utils import to_scipy_sparse_matrix
 from torch_geometric.data  import Data
 from torch.nn.functional   import softmax, sigmoid, relu
 from torch.nn              import Parameter
-from pool                  import DMoNPooling, mincut_pool, diff_pool
+from pool                  import DMoNPooling, mincut_pool, diff_pool, orthogonality_loss
 
 import gc
 
@@ -256,7 +256,8 @@ class Cluster(torch.nn.Module):
         x = self.data.x
         if self.use_model in ["gin", "sage"]:
             x = x.to_dense()
-        # DiffPool, MinCut and Ortho pool x with dense products, whatever the model
+        # DiffPool, MinCut and Ortho take dense features, whatever the model
+        # their losses no longer use x, but sparse features would change their results by rounding
         if self._get_name() in ["DiffPool", "MinCut", "Ortho"]:
             x = x.to_dense()
         # store sparse features in CSR format; a product with a COO matrix converts it to CSR on every call
@@ -482,7 +483,7 @@ class DMoN(Cluster):
 
     def forward(self, x):
         x = self.model(x)
-        x, _, adj, sp, o, c = self.pool(x = x, adj = self.data.edge_index)
+        x, _, _, sp, _, c = self.pool(x = x, adj = self.data.edge_index)
         x = x[0]
         # do not use orthogonality loss as per the original implementation
         # https://github.com/google-research/google-research/blob/master/graph_embedding/dmon/dmon.py
@@ -520,7 +521,7 @@ class DiffPool(Cluster):
     
     def forward(self, x):
         s = self.model(x)
-        _, adj, l, e = diff_pool(x = x, adj = self.data.edge_index, s = s)
+        _, _, l, e = diff_pool(x = x, adj = self.data.edge_index, s = s)
         loss = l + e
 
         return loss, softmax(s)
@@ -555,7 +556,7 @@ class MinCut(Cluster):
     
     def forward(self, x):
         s = self.model(x)
-        _, adj, mc, o = mincut_pool(x = x, adj = self.data.edge_index, s = s)
+        _, _, mc, o = mincut_pool(x = x, adj = self.data.edge_index, s = s)
         loss = mc + o
 
         return loss, softmax(s)
@@ -590,8 +591,8 @@ class Ortho(Cluster):
     
     def forward(self, x):
         s = self.model(x)
-        _, adj, mc, o = mincut_pool(x = x, adj = self.data.edge_index, s = s)
-        loss = o
+        # Ortho's loss is mincut_pool's orthogonality loss, so compute only that, on mincut_pool's softmax of s
+        loss = orthogonality_loss(torch.softmax(s.unsqueeze(0), dim = -1))
         s = softmax(s)
 
         return loss, softmax(s)

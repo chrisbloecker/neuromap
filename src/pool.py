@@ -14,6 +14,8 @@ from torch_geometric.nn.models.mlp import MLP
 # diff_pool, mincut_pool and DMoNPooling are dense_diff_pool, dense_mincut_pool and DMoNPooling from PyG 2.8.1
 # they are changed where adj is a sparse matrix
 # they make the identity matrix on the assignments' device instead of on the CPU
+# they leave out what no loss in training.py uses and return None in its place:
+# the pooled features, the pooled adjacency matrix and DMoN's orthogonality loss
 # each changed line has PyG's version as a comment above it
 def diff_pool(
     x: Tensor,
@@ -82,10 +84,9 @@ def diff_pool(
         mask = mask.view(batch_size, num_nodes, 1).to(x.dtype)
         x, s = x * mask, s * mask
 
-    out = torch.matmul(s.transpose(1, 2), x)
+    # no loss uses the pooled features and the pooled adjacency matrix, so they are not computed
+    # out = torch.matmul(s.transpose(1, 2), x)
     # out_adj = torch.matmul(torch.matmul(s.transpose(1, 2), adj), s)
-    out_adj = s[0].T @ torch.sparse.mm(adj[0], s[0])
-    out_adj = out_adj[None, :, :]
 
     # link_loss = adj - torch.matmul(s, s.transpose(1, 2))
     link_loss = -torch.matmul(s, s.transpose(1, 2)) + adj
@@ -95,7 +96,8 @@ def diff_pool(
 
     ent_loss = (-s * torch.log(s + 1e-15)).sum(dim=-1).mean()
 
-    return out, out_adj, link_loss, ent_loss
+    # return out, out_adj, link_loss, ent_loss
+    return None, None, link_loss, ent_loss
 
 
 def mincut_pool(
@@ -169,7 +171,8 @@ def mincut_pool(
         mask = mask.view(batch_size, num_nodes, 1).to(x.dtype)
         x, s = x * mask, s * mask
 
-    out = torch.matmul(s.transpose(1, 2), x)
+    # no loss uses the pooled features, so they are not computed
+    # out = torch.matmul(s.transpose(1, 2), x)
     # out_adj = torch.matmul(torch.matmul(s.transpose(1, 2), adj), s)
     out_adj = s[0].T @ torch.sparse.mm(adj[0], s[0])
     out_adj = out_adj[None, :, :]
@@ -185,7 +188,30 @@ def mincut_pool(
     mincut_loss = -(mincut_num / mincut_den)
     mincut_loss = torch.mean(mincut_loss)
 
-    # Orthogonality regularization.
+    # Orthogonality regularization, in orthogonality_loss, which Ortho uses alone.
+    ortho_loss = orthogonality_loss(s)
+
+    # no loss uses the coarsened adjacency matrix, so it is not fixed and normalized
+    # EPS = 1e-15
+    #
+    # # Fix and normalize coarsened adjacency matrix.
+    # ind = torch.arange(k, device=out_adj.device)
+    # out_adj[:, ind, ind] = 0
+    # d = torch.einsum("ijk->ij", out_adj)
+    # d = torch.sqrt(d)[:, None] + EPS
+    # out_adj = (out_adj / d) / d.transpose(1, 2)
+
+    # return out, out_adj, mincut_loss, ortho_loss
+    return None, None, mincut_loss, ortho_loss
+
+
+def orthogonality_loss(s: Tensor) -> Tensor:
+    """
+    mincut_pool's orthogonality loss, for the assignments s after the softmax, B × N × K.
+    Ortho uses it without the rest of mincut_pool.
+    """
+    k = s.size(-1)
+
     ss = torch.matmul(s.transpose(1, 2), s)
     # i_s = torch.eye(k).type_as(ss)
     # make the identity on ss's device, instead of on the CPU and copying it over in every call
@@ -196,16 +222,7 @@ def mincut_pool(
     )
     ortho_loss = torch.mean(ortho_loss)
 
-    EPS = 1e-15
-
-    # Fix and normalize coarsened adjacency matrix.
-    ind = torch.arange(k, device=out_adj.device)
-    out_adj[:, ind, ind] = 0
-    d = torch.einsum("ijk->ij", out_adj)
-    d = torch.sqrt(d)[:, None] + EPS
-    out_adj = (out_adj / d) / d.transpose(1, 2)
-
-    return out, out_adj, mincut_loss, ortho_loss
+    return ortho_loss
 
 
 def _rank3_trace(x: Tensor) -> Tensor:
@@ -224,9 +241,6 @@ def _rank3_diag(x: Tensor) -> Tensor:
     )
 
     return out
-
-
-EPS = 1e-15
 
 
 class DMoNPooling(torch.nn.Module):
@@ -332,9 +346,11 @@ class DMoNPooling(torch.nn.Module):
             mask = torch.ones(batch_size, num_nodes, dtype=torch.bool, device=x.device)
 
         mask = mask.view(batch_size, num_nodes, 1).to(x.dtype)
-        x, s = x * mask, s * mask
+        # x, s = x * mask, s * mask
+        s = s * mask
 
-        out = F.selu(torch.matmul(s.transpose(1, 2), x))
+        # no loss uses the pooled features, so they are not computed
+        # out = F.selu(torch.matmul(s.transpose(1, 2), x))
         # out_adj = torch.matmul(torch.matmul(s.transpose(1, 2), adj), s)
         out_adj = s[0].T @ torch.sparse.mm(adj[0], s[0])
         out_adj = out_adj[None, :, :]
@@ -357,15 +373,16 @@ class DMoNPooling(torch.nn.Module):
         spectral_loss = spectral_loss.mean()
 
         # Orthogonality regularization:
-        ss = torch.matmul(s.transpose(1, 2), s)
+        # DMoN leaves the orthogonality loss out of its loss, as the original implementation does, so it is not computed
+        # ss = torch.matmul(s.transpose(1, 2), s)
         # i_s = torch.eye(C).type_as(ss)
-        # make the identity on ss's device, instead of on the CPU and copying it over in every call
-        i_s = torch.eye(C, dtype=ss.dtype, device=ss.device)
-        ortho_loss = torch.norm(
-            ss / torch.norm(ss, dim=(-1, -2), keepdim=True) - i_s / torch.norm(i_s),
-            dim=(-1, -2),
-        )
-        ortho_loss = ortho_loss.mean()
+        # make the identity on s's device, instead of on the CPU and copying it over in every call
+        i_s = torch.eye(C, dtype=s.dtype, device=s.device)
+        # ortho_loss = torch.norm(
+        #     ss / torch.norm(ss, dim=(-1, -2), keepdim=True) - i_s / torch.norm(i_s),
+        #     dim=(-1, -2),
+        # )
+        # ortho_loss = ortho_loss.mean()
 
         # Cluster loss:
         cluster_size = torch.einsum("ijk->ik", s)  # B x C
@@ -373,14 +390,16 @@ class DMoNPooling(torch.nn.Module):
         cluster_loss = cluster_loss / mask.sum(dim=1) * torch.norm(i_s) - 1
         cluster_loss = cluster_loss.mean()
 
-        # Fix and normalize coarsened adjacency matrix:
-        ind = torch.arange(C, device=out_adj.device)
-        out_adj[:, ind, ind] = 0
-        d = torch.einsum("ijk->ij", out_adj)
-        d = torch.sqrt(d)[:, None] + EPS
-        out_adj = (out_adj / d) / d.transpose(1, 2)
+        # no loss uses the coarsened adjacency matrix, so it is not fixed and normalized
+        # # Fix and normalize coarsened adjacency matrix:
+        # ind = torch.arange(C, device=out_adj.device)
+        # out_adj[:, ind, ind] = 0
+        # d = torch.einsum("ijk->ij", out_adj)
+        # d = torch.sqrt(d)[:, None] + EPS
+        # out_adj = (out_adj / d) / d.transpose(1, 2)
 
-        return s, out, out_adj, spectral_loss, ortho_loss, cluster_loss
+        # return s, out, out_adj, spectral_loss, ortho_loss, cluster_loss
+        return s, None, None, spectral_loss, None, cluster_loss
 
     def __repr__(self) -> str:
         return (
