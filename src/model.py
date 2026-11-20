@@ -61,6 +61,7 @@ class GCNModel(torch.nn.Module):
 
         self.edge_index = edge_index
 
+        # the graph is the same in every pass, so with cached = True, each GCNConv normalises its adjacency matrix only in the first pass
         self.model = GCN( in_channels     = in_channels
                         , hidden_channels = hidden_channels
                         , num_layers      = num_layers
@@ -68,6 +69,7 @@ class GCNModel(torch.nn.Module):
                         , act             = act
                         , dropout         = dropout
                         , norm            = norm
+                        , cached          = True
                         )
 
     def forward(self, x):
