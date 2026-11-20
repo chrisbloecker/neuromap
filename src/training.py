@@ -480,10 +480,12 @@ class DMoN(Cluster):
     def _reset(self):
         super()._reset()
         self.pool = DMoNPooling(channels = [self.out_channels, self.out_channels], k = self.out_channels, dropout = self.dropout).to(device = self.device)
+        # the adjacency in CSR format, which DMoNPooling takes; a product with a COO matrix converts it to CSR on every call
+        self.adj = self.data.edge_index.coalesce().to_sparse_csr()
 
     def forward(self, x):
         x = self.model(x)
-        x, _, _, sp, _, c = self.pool(x = x, adj = self.data.edge_index)
+        x, _, _, sp, _, c = self.pool(x = x, adj = self.adj)
         x = x[0]
         # do not use orthogonality loss as per the original implementation
         # https://github.com/google-research/google-research/blob/master/graph_embedding/dmon/dmon.py
@@ -554,9 +556,14 @@ class MinCut(Cluster):
                         , **kwargs
                         )
     
+    def _reset(self):
+        super()._reset()
+        # the adjacency in CSR format, which mincut_pool takes; a product with a COO matrix converts it to CSR on every call
+        self.adj = self.data.edge_index.coalesce().to_sparse_csr()
+
     def forward(self, x):
         s = self.model(x)
-        _, _, mc, o = mincut_pool(x = x, adj = self.data.edge_index, s = s)
+        _, _, mc, o = mincut_pool(x = x, adj = self.adj, s = s)
         loss = mc + o
 
         return loss, softmax(s)
