@@ -54,7 +54,8 @@ def keyed_dropout(x: Tensor, p: float, batch: BatchState, *row_keys: Tensor) -> 
     Dropout whose mask for x[i, j] depends only on the epoch's seed, the dropout's place in the forward pass, the row keys at i, and j.
     With global node ids as row keys, a node gets the same mask in every batch whose subgraph contains it, and in every pass of the epoch.
     """
-    h_row = _hash32(_hash32(torch.tensor(batch.seed, device = x.device)) ^ batch.calls)
+    # hash the seed and the call index as Python ints; a GPU tensor made from a Python int waits for all queued GPU work
+    h_row = _hash32(_hash32(batch.seed) ^ batch.calls)
     for key in row_keys:
         h_row = _hash32(h_row ^ _hash32(key))
     h_col = _hash32(torch.arange(x.size(1), device = x.device))
@@ -106,6 +107,7 @@ class NodeBatchNorm(torch.nn.Module):
 
         self.norm  = norm
         self.batch = batch
+        self.hops  = 0 # the passes that stop here need the nodes within this many hops of the batch; _use_batch sets it in GNN layers
         self.start_epoch()
 
     def start_epoch(self) -> None:
@@ -158,7 +160,8 @@ class NodeBatchNorm(torch.nn.Module):
                              + torch.sum(self.var.grad  * torch.sum((seeds - self.mean.detach())**2, dim = 0)) / self.count
                              )
 
-        return (x - self.mean) / torch.sqrt(self.var + bn.eps) * bn.weight + bn.bias
+        # multiply by one factor per channel, so that the backward pass keeps x - mean but not also the normalised x
+        return (x - self.mean) * (bn.weight * torch.rsqrt(self.var + bn.eps)) + bn.bias
 
 
 class KeyedGATConv(GATConv):
@@ -185,15 +188,16 @@ class KeyedGAT(GAT):
         return KeyedGATConv(in_channels, out_channels, concat = not getattr(self, '_is_conv_to_out', False), dropout = self.dropout.p, **kwargs)
 
 
-def first_rows(x: Tensor, num_rows: int, num_cols: Maybe[int] = None) -> Tensor:
+def row_slice(x: Tensor, start: int, end: int, num_cols: Maybe[int] = None) -> Tensor:
     """
-    The first num_rows rows of a dense or CSR matrix.
+    Rows start to end of a dense or CSR matrix.
     torch does not slice the rows of a CSR matrix; the slice has num_cols columns if given, which must hold all of the rows' entries.
     """
     if x.layout != torch.sparse_csr:
-        return x[:num_rows]
-    crow = x.crow_indices()[:num_rows + 1]
-    return torch.sparse_csr_tensor(crow, x.col_indices()[:crow[-1]], x.values()[:crow[-1]], (num_rows, x.size(1) if num_cols is None else num_cols))
+        return x[start:end]
+    crow        = x.crow_indices()[start:end + 1]
+    first, last = int(crow[0]), int(crow[-1])
+    return torch.sparse_csr_tensor(crow - first, x.col_indices()[first:last], x.values()[first:last], (end - start, x.size(1) if num_cols is None else num_cols))
 
 
 def _forward_by_layer(gnn: torch.nn.Module, x: Tensor, adjs: List[Tensor]) -> Tensor:
@@ -203,7 +207,7 @@ def _forward_by_layer(gnn: torch.nn.Module, x: Tensor, adjs: List[Tensor]) -> Te
     As the models here use BasicGNN, without jumping knowledge and with act_first = False.
     """
     for i, (conv, norm, adj) in enumerate(zip(gnn.convs, gnn.norms, adjs)):
-        x = conv(x, adj) if isinstance(conv, GCNConv) else conv((x, first_rows(x, adj.size(0))), adj)
+        x = conv(x, adj) if isinstance(conv, GCNConv) else conv((x, row_slice(x, 0, adj.size(0))), adj)
         if i < gnn.num_layers - 1:
             x = gnn.dropout(gnn.act(norm(x)))
     return x
@@ -221,6 +225,12 @@ def _use_batch(model: torch.nn.Module, batch: BatchState) -> None:
             setattr(model.get_submodule(parent), child, NodeBatchNorm(module, batch))
         elif isinstance(module, KeyedGATConv):
             module.batch = batch
+
+    # a NodeBatchNorm in GNN layer i, inside the layer's conv or after it, needs the nodes within i + 1 hops
+    for i, (conv, norm) in enumerate(zip(getattr(model, "convs", []), getattr(model, "norms", []))):
+        for module in [*conv.modules(), norm]:
+            if isinstance(module, NodeBatchNorm):
+                module.hops = i + 1
 
 
 class LinearModel(torch.nn.Module):
@@ -271,7 +281,18 @@ class MLPModel(torch.nn.Module):
         return self.model.lins[-1](x)
 
 
-class GCNModel(torch.nn.Module):
+class GNNModel(torch.nn.Module):
+    """
+    The forward pass of the GNN models, which keep PyG's model in self.model and the transposed adjacency in self.edge_index.
+    """
+    def forward(self, x, adjs = None):
+        # in batched training, adjs holds one adjacency matrix per layer, from a batch's subgraph
+        if adjs is None:
+            return self.model(x = x, edge_index = self.edge_index)
+        return _forward_by_layer(self.model, x, adjs)
+
+
+class GCNModel(GNNModel):
     def __init__( self
                 , edge_index
                 , in_channels     : int
@@ -301,14 +322,8 @@ class GCNModel(torch.nn.Module):
                         )
         _use_batch(self.model, self.batch)
 
-    def forward(self, x, adjs = None):
-        # in batched training, adjs holds one adjacency matrix per layer, from a batch's subgraph
-        if adjs is None:
-            return self.model(x = x, edge_index = self.edge_index)
-        return _forward_by_layer(self.model, x, adjs)
 
-
-class GINModel(torch.nn.Module):
+class GINModel(GNNModel):
     def __init__( self
                 , edge_index
                 , in_channels     : int
@@ -334,14 +349,8 @@ class GINModel(torch.nn.Module):
                         )
         _use_batch(self.model, self.batch)
 
-    def forward(self, x, adjs = None):
-        # in batched training, adjs holds one adjacency matrix per layer, from a batch's subgraph
-        if adjs is None:
-            return self.model(x = x, edge_index = self.edge_index)
-        return _forward_by_layer(self.model, x, adjs)
 
-
-class GATModel(torch.nn.Module):
+class GATModel(GNNModel):
     def __init__( self
                 , edge_index
                 , in_channels     : int
@@ -367,14 +376,8 @@ class GATModel(torch.nn.Module):
                              )
         _use_batch(self.model, self.batch)
 
-    def forward(self, x, adjs = None):
-        # in batched training, adjs holds one adjacency matrix per layer, from a batch's subgraph
-        if adjs is None:
-            return self.model(x = x, edge_index = self.edge_index)
-        return _forward_by_layer(self.model, x, adjs)
 
-
-class SAGEModel(torch.nn.Module):
+class SAGEModel(GNNModel):
     def __init__( self
                 , edge_index
                 , in_channels     : int
@@ -399,9 +402,3 @@ class SAGEModel(torch.nn.Module):
                               , dropout         = dropout
                               )
         _use_batch(self.model, self.batch)
-
-    def forward(self, x, adjs = None):
-        # in batched training, adjs holds one adjacency matrix per layer, from a batch's subgraph
-        if adjs is None:
-            return self.model(x = x, edge_index = self.edge_index)
-        return _forward_by_layer(self.model, x, adjs)

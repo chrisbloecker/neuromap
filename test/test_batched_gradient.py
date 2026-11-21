@@ -58,8 +58,9 @@ def epoch(method, model, data, dropout, batch_size):
 def difference(a, b):
     # largest difference, relative to the largest entry over all tensors
     # a bias in front of a BatchNorm has gradient 0, so only rounding is left in it
+    # torch's max is NaN if any entry is NaN; Python's max skips a NaN unless it comes first
     scale = max([float(v.abs().max()) for v in b] + [1e-30])
-    return max([float((u - v).abs().max()) for u, v in zip(a, b)] + [0.0]) / scale
+    return float(torch.tensor([float((u - v).abs().max()) for u, v in zip(a, b)] + [0.0]).max()) / scale
 
 
 data     = make_graph(90)
@@ -74,7 +75,8 @@ for method in [Neuromap, NeuromapD, NOCD, DMoN, DiffPool, MinCut, Ortho]:
         l_batch, g_batch, b_batch = epoch(method, model, data, 0.5, 13)
         dropout = [abs(l_batch - l_one) / abs(l_one), difference(g_batch, g_one), difference(b_batch, b_one)]
 
-        passed = len(g_full) == len(g_batch) and max(no_dropout + dropout) <= tolerance
+        # a NaN fails, because NaN <= tolerance is false
+        passed = len(g_full) == len(g_batch) and all(d <= tolerance for d in no_dropout + dropout)
         if not passed:
             failures.append(f"{method.__name__} {model}")
         print( f"{method.__name__:9} {model:4}"

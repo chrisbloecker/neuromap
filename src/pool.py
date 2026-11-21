@@ -10,6 +10,8 @@ import torch.nn.functional as F
 from torch_geometric.typing import OptTensor, SparseTensor
 from torch_geometric.nn.models.mlp import MLP
 
+from model import row_slice
+
 
 def pool_features(s: Tensor, x: Tensor, chunk_size: int) -> Tensor:
     """
@@ -21,13 +23,7 @@ def pool_features(s: Tensor, x: Tensor, chunk_size: int) -> Tensor:
     out = torch.zeros(s.size(1), x.size(1), device = s.device)
     for start in range(0, x.size(0), chunk_size):
         end = min(start + chunk_size, x.size(0))
-        if x.layout == torch.sparse_csr:
-            # torch does not slice the rows of a CSR matrix, so take the stored entries of rows start to end
-            crow  = x.crow_indices()[start:end + 1]
-            chunk = torch.sparse_csr_tensor(crow - crow[0], x.col_indices()[crow[0]:crow[-1]], x.values()[crow[0]:crow[-1]], (end - start, x.size(1)))
-        else:
-            chunk = x[start:end]
-        out += s[start:end].t() @ chunk.to(s.device)
+        out += s[start:end].t() @ row_slice(x, start, end).to(s.device)
     return out
 
 

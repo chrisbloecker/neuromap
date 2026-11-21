@@ -3,9 +3,8 @@ import nocd
 
 from abc                   import abstractmethod
 from model                 import LinearModel as Linear, MLPModel as MLP, GCNModel as GCN, GINModel as GIN, GATModel as GAT, SAGEModel as SAGE
-from model                 import NodeBatchNorm, StopForward, keyed_dropout, first_rows
-from numpy                 import inf, ones
-from scipy.sparse          import csr_matrix
+from model                 import NodeBatchNorm, StopForward, keyed_dropout, row_slice
+from numpy                 import inf
 from scipy.sparse.csgraph  import reverse_cuthill_mckee
 from time                  import sleep
 from typing                import List, Optional as Maybe, Tuple
@@ -305,13 +304,13 @@ class Cluster(torch.nn.Module):
                 x = x.coalesce().to_sparse_csr()
             return x
 
-        self.data = data.to(self.device, "edge_index")
+        # a full-graph fit on the same data moves x to the device in place; move it back, so that data does not keep it there
+        self.data = data.to(self.device, "edge_index").cpu("x")
 
         # batches of nodes that are consecutive in reverse Cuthill–McKee order, which puts linked nodes close together
         # then the nodes within a few hops of a batch are fewer, and fewer of them are also near other batches
         # the order changes only an epoch's memory and time; the gradient is the same for any order, up to rounding
-        links        = self.data.edge_index.indices().cpu().numpy()
-        adj          = csr_matrix((ones(links.shape[1]), (links[0], links[1])), shape = (self.data.num_nodes, self.data.num_nodes))
+        adj          = to_scipy_sparse_matrix(self.data.edge_index.indices(), num_nodes = self.data.num_nodes).tocsr()
         order        = torch.as_tensor(reverse_cuthill_mckee(adj, symmetric_mode = False).copy(), dtype = torch.long, device = self.device)
         self.batches = order.split(batch_size)
         # the row of each node in the batches' outputs, put together in order
@@ -320,7 +319,7 @@ class Cluster(torch.nn.Module):
         self.subgraphs = {}
 
         # store sparse features in CSR format, whose rows csr_rows takes
-        x = self.data.x.cpu()
+        x = self.data.x
         return x.coalesce().to_sparse_csr() if x.is_sparse else x
 
     def _neighbourhood(self, seeds: Tensor) -> Tuple[Tensor, List[int]]:
@@ -370,13 +369,16 @@ class Cluster(torch.nn.Module):
                 self.subgraphs[b] = (n_id.cpu(), counts, self._subgraph(n_id, counts[self.num_layers - 1]).cpu())
         return self.subgraphs[b]
 
-    def _encode_batch(self, x: Tensor, b: int) -> Tensor:
+    def _encode_batch(self, x: Tensor, b: int, hops: Maybe[int] = None) -> Tensor:
         """
         The model's output for batch b's nodes, computed on the subgraph of the nodes whose features reach them.
         Layer i of the model's L layers computes the nodes within L - i - 1 hops of the batch, from the nodes within L - i hops.
         Those are the rows that the next layer reads, and the last layer computes the batch's nodes.
+        A pass that stops at a NodeBatchNorm passes the NodeBatchNorm's hops; then only that many layers run, on the nodes within that many hops.
         """
         n_id, counts, adj = self._batch_subgraph(b)
+        L    = len(counts) - 1 if hops is None else hops
+        n_id = n_id[:counts[L]]
         self.model.batch.start(n_id.to(self.device), counts[0])
 
         # move the subgraph's features from CPU memory to the device
@@ -388,9 +390,8 @@ class Cluster(torch.nn.Module):
             return self.encode(x_sub)
 
         # layer i's adjacency matrix: the first rows of the subgraph's, with a column for each node within L - i hops
-        L    = self.num_layers
         adj  = adj.to(self.device)
-        adjs = [first_rows(adj, counts[L - i - 1], counts[L - i]) for i in range(L)]
+        adjs = [row_slice(adj, 0, counts[L - i - 1], counts[L - i]) for i in range(L)]
         return self.encode(x_sub, adjs)
 
     def _encode(self, x: Tensor) -> Tensor:
@@ -413,9 +414,11 @@ class Cluster(torch.nn.Module):
         order = []
         with torch.no_grad():
             while len(order) < len(norms):
+                # the next NodeBatchNorm in the forward pass is in the lowest layer of those without statistics
+                hops = min(norm.hops for norm in norms if norm.mean is None)
                 for b in range(len(self.batches)):
                     try:
-                        self._encode_batch(x, b)
+                        self._encode_batch(x, b, hops)
                     except StopForward:
                         pass
                 # the first NodeBatchNorm without statistics collected them in this pass
@@ -433,7 +436,7 @@ class Cluster(torch.nn.Module):
             norm.backprop = True
             for b in range(len(self.batches)):
                 try:
-                    self._encode_batch(x, b)
+                    self._encode_batch(x, b, norm.hops)
                 except StopForward as stop:
                     stop.surrogate.backward()
             norm.backprop = False
@@ -442,8 +445,8 @@ class Cluster(torch.nn.Module):
         """
         Backpropagates one training epoch's loss into the parameters' gradients.
 
-        In batched training, the loss depends on the model's parameters θ only through the model's output z.
-        So dL/dθ = Σ_u (∂z_u/∂θ)ᵀ H_u, with H = ∂L/∂z.
+        In batched training, the loss depends on the model's parameters θ through the model's output z, and through extra_regularisation, which NOCD uses for weight decay.
+        So dL/dθ = Σ_u (∂z_u/∂θ)ᵀ H_u, with H = ∂L/∂z, plus the gradient of extra_regularisation, which the backward pass of the loss adds directly.
         A pass without gradients gives z, batch by batch, and backpropagating the loss from z gives H.
         A second pass backpropagates H into each batch's output, and the gradients add up to the whole graph's.
         """
@@ -467,8 +470,11 @@ class Cluster(torch.nn.Module):
         loss.backward()
 
         if self.batch_size is not None:
+            # the remaining passes need only H; the loss's graph still holds z, so release the loss as well
+            H = z.grad
+            del z, s, loss
             for b, seeds in enumerate(self.batches):
-                self._encode_batch(x, b).backward(z.grad[seeds])
+                self._encode_batch(x, b).backward(H[seeds])
             self._backprop_statistics(x, norms)
 
     def fit( self
@@ -487,6 +493,9 @@ class Cluster(torch.nn.Module):
             Without it, every epoch runs on the whole graph.
             With it, every epoch runs over batches of batch_size nodes, each on the subgraph of the nodes whose features reach it.
             The gradient is the same as on the whole graph, up to rounding, and the features stay in CPU memory.
+            With BatchNorm, the result can still depend on batch_size.
+            The layer before a BatchNorm has biases whose gradient is 0, so only rounding is left in it, and Adam turns that rounding into steps of the learning rate.
+            The eval pass normalises with the running mean, which lags behind these steps, so they change the eval loss and the partition.
         """
         x = self._prepare(data, batch_size)
         ls_best : List[float]  = [] # best losses
@@ -515,6 +524,8 @@ class Cluster(torch.nn.Module):
                     while epoch < epochs and no_improvement < patience:
                         self.train()
                         optimizer.zero_grad()
+                        # release the last eval's assignment before the backward pass; s_best keeps the best one
+                        s = None
                         self._gradient(x)
                         optimizer.step()
                         if lr_schedule:
@@ -610,7 +621,7 @@ class Neuromap(Cluster):
     def objective(self, x, z):
         s = softmax(z / sigmoid(self.t), dim = 1)
 
-        # the pool gets the features stored in _prepare, so NeuromapD's dropout does not reach x_pooled
+        # the pool gets the features in the layout that _prepare stores for it
         _, _, loss = self.pool(x = self.pool_x, s = s)
 
         return loss, s
