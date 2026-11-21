@@ -3,17 +3,46 @@ import nocd
 
 from abc                   import abstractmethod
 from model                 import LinearModel as Linear, MLPModel as MLP, GCNModel as GCN, GINModel as GIN, GATModel as GAT, SAGEModel as SAGE
+from model                 import NodeBatchNorm, StopForward, keyed_dropout, row_slice
 from numpy                 import inf
+from scipy.sparse.csgraph  import reverse_cuthill_mckee
 from time                  import sleep
-from typing                import List, Optional as Maybe
+from typing                import List, Optional as Maybe, Tuple
 from torch                 import Tensor
 from torch_geometric.utils import to_scipy_sparse_matrix
 from torch_geometric.data  import Data
 from torch.nn.functional   import softmax, sigmoid, relu
 from torch.nn              import Parameter
-from pool                  import DMoNPooling, mincut_pool, diff_pool
+from torch.utils.checkpoint import checkpoint
+from pool                  import DMoNPooling, mincut_pool, diff_pool, pool_features
 
 import gc
+
+
+def csr_rows(A: Tensor, rows: Tensor) -> Tensor:
+    """
+    The given rows of a CSR matrix, in their order, as a CSR matrix.
+    torch has no index_select for CSR matrices.
+    """
+    crow   = A.crow_indices()
+    starts = crow[rows]
+    counts = crow[rows + 1] - starts
+    crow_rows = torch.cat([torch.zeros(1, dtype = crow.dtype, device = crow.device), torch.cumsum(counts, dim = 0)])
+
+    # each entry's position in A is its row's start in A plus its offset within the row
+    entries = torch.repeat_interleave(starts - crow_rows[:-1], counts) + torch.arange(int(crow_rows[-1]), device = crow.device)
+
+    return torch.sparse_csr_tensor(crow_rows, A.col_indices()[entries], A.values()[entries], (len(rows), A.size(1)))
+
+
+def random_projection(adj: Tensor, d: int) -> Tensor:
+    """
+    Features x = A R for a graph without features, with R an N × d matrix of Gaussian entries with variance 1/d.
+    With the adjacency matrix as features, the first layer has N × hidden weights; with x, it has d × hidden.
+    By the Johnson–Lindenstrauss lemma, d of order log N / ε² keeps the distances between all pairs of adjacency rows within a factor 1 ± ε, with high probability.
+    """
+    R = torch.randn(adj.size(1), d, device = adj.device) / d**0.5
+    return adj.to_sparse_csr() @ R
 
 
 # create smart teleportation flow matrix and flow distribution
@@ -52,8 +81,11 @@ def mkSmartTeleportationFlow(A, alpha = 0.15, iter = 1000):
 
 
 class MapEquationPooling(torch.nn.Module):
-    def __init__(self, adj: Tensor, *args, **kwargs) -> None:
+    def __init__(self, adj: Tensor, chunk_size: Maybe[int] = None, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+
+        # in batched training, x stays in CPU memory, and x_pooled is computed from chunk_size of its rows at a time
+        self.chunk_size = chunk_size
 
         self.F, self.p = mkSmartTeleportationFlow(adj)
 
@@ -85,7 +117,7 @@ class MapEquationPooling(torch.nn.Module):
                    + torch.sum(p_m     * torch.log2(p_m.clamp_min(1e-30)))
 
         # multiply x^T @ s first, for the same reason as F @ s above; for x in CSC format, x.t() is in CSR format
-        x_pooled   = (x.t() @ s).t()
+        x_pooled   = (x.t() @ s).t() if self.chunk_size is None else pool_features(s, x, self.chunk_size)
         # multiply adj @ s first, for the same reason as F @ s above
         adj_pooled = s.T @ (self.adj @ s)
 
@@ -230,12 +262,220 @@ class Cluster(torch.nn.Module):
         
         self.model = self.model.to(self.device)
 
+    def encode(self, x, adjs = None):
+        """
+        The model's output, on the whole graph, or in batched training, on a batch's subgraph, with one adjacency matrix per layer.
+        """
+        if adjs is None:
+            return self.model(x)
+        return self.model(x, adjs)
+
     @abstractmethod
+    def objective(self, x, z):
+        """
+        The loss and the assignment from the model's output z for all nodes.
+        """
+        raise NotImplementedError(f"objective not implemented on {self._get_name()}")
+
     def forward(self, x):
-        raise NotImplementedError(f"forward not implemented on {self._get_name()}")
-    
+        return self.objective(x, self.encode(x))
+
     def extra_regularisation(self) -> float:
         return 0
+
+    def _prepare(self, data: Data, batch_size: Maybe[int]) -> Tensor:
+        """
+        Stores the graph on the device, and returns the features in the form the model takes them.
+        In batched training, the features stay in CPU memory, and _encode_batch moves a batch's rows to the device.
+        """
+        self.batch_size = batch_size
+
+        if batch_size is None:
+            self.data = data.to(self.device)
+
+            x = self.data.x
+            if self.use_model in ["gin", "sage"]:
+                x = x.to_dense()
+            # DiffPool, MinCut and Ortho pool x with dense products, whatever the model
+            if self._get_name() in ["DiffPool", "MinCut", "Ortho"]:
+                x = x.to_dense()
+            # store sparse features in CSR format; a product with a COO matrix converts it to CSR on every call
+            if x.is_sparse:
+                x = x.coalesce().to_sparse_csr()
+            return x
+
+        # a full-graph fit on the same data moves x to the device in place; move it back, so that data does not keep it there
+        self.data = data.to(self.device, "edge_index").cpu("x")
+
+        # batches of nodes that are consecutive in reverse Cuthill–McKee order, which puts linked nodes close together
+        # then the nodes within a few hops of a batch are fewer, and fewer of them are also near other batches
+        # the order changes only an epoch's memory and time; the gradient is the same for any order, up to rounding
+        adj          = to_scipy_sparse_matrix(self.data.edge_index.indices(), num_nodes = self.data.num_nodes).tocsr()
+        order        = torch.as_tensor(reverse_cuthill_mckee(adj, symmetric_mode = False).copy(), dtype = torch.long, device = self.device)
+        self.batches = order.split(batch_size)
+        # the row of each node in the batches' outputs, put together in order
+        self.positions = torch.argsort(order)
+        # each batch's subgraph, built when it is first needed, by _batch_subgraph
+        self.subgraphs = {}
+
+        # store sparse features in CSR format, whose rows csr_rows takes
+        x = self.data.x
+        return x.coalesce().to_sparse_csr() if x.is_sparse else x
+
+    def _neighbourhood(self, seeds: Tensor) -> Tuple[Tensor, List[int]]:
+        """
+        The nodes whose features reach the seeds through the model's layers, ordered by hops from the seeds, one hop per layer.
+        Also returns the number of nodes within 0, 1, ..., L hops.
+        """
+        adj_t    = self.model.edge_index
+        seen     = torch.zeros(adj_t.size(0), dtype = torch.bool, device = self.device)
+        n_id     = seeds
+        frontier = seeds
+        counts   = [len(seeds)]
+        seen[seeds] = True
+        for _ in range(self.num_layers):
+            # row v of adj_t holds the nodes that send messages to v
+            neighbours     = csr_rows(adj_t, frontier).col_indices()
+            frontier       = torch.unique(neighbours[~seen[neighbours]])
+            seen[frontier] = True
+            n_id           = torch.cat([n_id, frontier])
+            counts.append(len(n_id))
+        return n_id, counts
+
+    def _subgraph(self, n_id: Tensor, num_rows: int) -> Tensor:
+        """
+        The rows of the model's adjacency matrix for the first num_rows nodes of n_id, with a column for each node of n_id, in n_id's order.
+        The first num_rows nodes are within L - 1 hops of the batch, so all of their neighbours are in n_id.
+        """
+        rows  = csr_rows(self.model.edge_index, n_id[:num_rows])
+        local = torch.full((self.model.edge_index.size(0),), -1, device = self.device)
+        local[n_id] = torch.arange(len(n_id), device = self.device)
+
+        row = torch.repeat_interleave(torch.arange(num_rows, device = self.device), rows.crow_indices().diff())
+        return torch.sparse_coo_tensor(torch.stack([row, local[rows.col_indices()]]), rows.values(), (num_rows, len(n_id))).coalesce().to_sparse_csr()
+
+    def _batch_subgraph(self, b: int) -> Tuple[Tensor, List[int], Maybe[Tensor]]:
+        """
+        Batch b's subgraph: its nodes, ordered by hops from the batch; the number of them within 0, 1, ..., L hops; and the adjacency matrix from them to the nodes within L - 1 hops.
+        Every pass and every trial of a fit uses the same subgraphs, so they are built once and kept in CPU memory.
+        Building them took about 80% of a forward pass on PubMed.
+        """
+        if b not in self.subgraphs:
+            seeds = self.batches[b]
+            if self.use_model in ["lin", "mlp"]:
+                self.subgraphs[b] = (seeds.cpu(), [len(seeds)], None)
+            else:
+                n_id, counts = self._neighbourhood(seeds)
+                self.subgraphs[b] = (n_id.cpu(), counts, self._subgraph(n_id, counts[self.num_layers - 1]).cpu())
+        return self.subgraphs[b]
+
+    def _encode_batch(self, x: Tensor, b: int, hops: Maybe[int] = None) -> Tensor:
+        """
+        The model's output for batch b's nodes, computed on the subgraph of the nodes whose features reach them.
+        Layer i of the model's L layers computes the nodes within L - i - 1 hops of the batch, from the nodes within L - i hops.
+        Those are the rows that the next layer reads, and the last layer computes the batch's nodes.
+        A pass that stops at a NodeBatchNorm passes the NodeBatchNorm's hops; then only that many layers run, on the nodes within that many hops.
+        """
+        n_id, counts, adj = self._batch_subgraph(b)
+        L    = len(counts) - 1 if hops is None else hops
+        n_id = n_id[:counts[L]]
+        self.model.batch.start(n_id.to(self.device), counts[0])
+
+        # move the subgraph's features from CPU memory to the device
+        x_sub = (csr_rows(x, n_id) if x.layout == torch.sparse_csr else x[n_id]).to(self.device)
+        if self.use_model in ["gin", "sage"]:
+            x_sub = x_sub.to_dense()
+
+        if self.use_model in ["lin", "mlp"]:
+            return self.encode(x_sub)
+
+        # layer i's adjacency matrix: the first rows of the subgraph's, with a column for each node within L - i hops
+        adj  = adj.to(self.device)
+        adjs = [row_slice(adj, 0, counts[L - i - 1], counts[L - i]) for i in range(L)]
+        return self.encode(x_sub, adjs)
+
+    def _encode(self, x: Tensor) -> Tensor:
+        """
+        The model's output for all nodes, on the whole graph, or in batched training, batch by batch.
+        """
+        if self.batch_size is None:
+            return self.encode(x)
+        return torch.cat([self._encode_batch(x, b) for b in range(len(self.batches))])[self.positions]
+
+    def _collect_statistics(self, x: Tensor) -> List[NodeBatchNorm]:
+        """
+        Collects the mean and variance over all nodes for each NodeBatchNorm, in one pass over the batches each, in the order of the forward pass.
+        Returns the NodeBatchNorms in that order.
+        """
+        norms = [module for module in self.model.modules() if isinstance(module, NodeBatchNorm)]
+        for norm in norms:
+            norm.start_epoch()
+
+        order = []
+        with torch.no_grad():
+            while len(order) < len(norms):
+                # the next NodeBatchNorm in the forward pass is in the lowest layer of those without statistics
+                hops = min(norm.hops for norm in norms if norm.mean is None)
+                for b in range(len(self.batches)):
+                    try:
+                        self._encode_batch(x, b, hops)
+                    except StopForward:
+                        pass
+                # the first NodeBatchNorm without statistics collected them in this pass
+                norm = next(norm for norm in norms if norm.mean is None and norm.count > 0)
+                norm.finish_statistics()
+                order.append(norm)
+        return order
+
+    def _backprop_statistics(self, x: Tensor, norms: List[NodeBatchNorm]) -> None:
+        """
+        Adds the gradient that flows through each NodeBatchNorm's statistics, in one pass over the batches each, from the last NodeBatchNorm to the first.
+        The statistics of a NodeBatchNorm feed the inputs of the ones after it, so their gradient is complete only after those passes.
+        """
+        for norm in reversed(norms):
+            norm.backprop = True
+            for b in range(len(self.batches)):
+                try:
+                    self._encode_batch(x, b, norm.hops)
+                except StopForward as stop:
+                    stop.surrogate.backward()
+            norm.backprop = False
+
+    def _gradient(self, x: Tensor) -> None:
+        """
+        Backpropagates one training epoch's loss into the parameters' gradients.
+
+        In batched training, the loss depends on the model's parameters θ through the model's output z, and through extra_regularisation, which NOCD uses for weight decay.
+        So dL/dθ = Σ_u (∂z_u/∂θ)ᵀ H_u, with H = ∂L/∂z, plus the gradient of extra_regularisation, which the backward pass of the loss adds directly.
+        A pass without gradients gives z, batch by batch, and backpropagating the loss from z gives H.
+        A second pass backpropagates H into each batch's output, and the gradients add up to the whole graph's.
+        """
+        if self.batch_size is None:
+            loss, s = self.forward(x = x)
+        else:
+            # one set of dropout masks per epoch, the same in every pass
+            self.model.batch.seed = int(torch.randint(2**32, ()))
+            norms = self._collect_statistics(x)
+
+            with torch.no_grad():
+                z = self._encode(x)
+            z.requires_grad_()
+            loss, s = self.objective(x, z)
+
+        loss += self.extra_regularisation()
+
+        if len(torch.nonzero(torch.isnan(s))) > 0:
+            raise Exception("Ran into nans.")
+
+        loss.backward()
+
+        if self.batch_size is not None:
+            # the remaining passes need only H; the loss's graph still holds z, so release the loss as well
+            H = z.grad
+            del z, s, loss
+            for b, seeds in enumerate(self.batches):
+                self._encode_batch(x, b).backward(H[seeds])
+            self._backprop_statistics(x, norms)
 
     def fit( self
            , data        : Data
@@ -246,22 +486,20 @@ class Cluster(torch.nn.Module):
            , num_trials  : int         =     1
            , max_fails   : int         =     1
            , verbose     : bool        = False
+           , batch_size  : Maybe[int]  = None
            ):
         """
+        batch_size : Maybe[int]
+            Without it, every epoch runs on the whole graph.
+            With it, every epoch runs over batches of batch_size nodes, each on the subgraph of the nodes whose features reach it.
+            The gradient is the same as on the whole graph, up to rounding, and the features stay in CPU memory.
+            With BatchNorm, the result can still depend on batch_size.
+            The layer before a BatchNorm has biases whose gradient is 0, so only rounding is left in it, and Adam turns that rounding into steps of the learning rate.
+            The eval pass normalises with the running mean, which lags behind these steps, so they change the eval loss and the partition.
         """
-        self.data = data.to(self.device)
+        x = self._prepare(data, batch_size)
         ls_best : List[float]  = [] # best losses
         ss_best : List[Tensor] = [] # best clusters
-
-        x = self.data.x
-        if self.use_model in ["gin", "sage"]:
-            x = x.to_dense()
-        # DiffPool, MinCut and Ortho pool x with dense products, whatever the model
-        if self._get_name() in ["DiffPool", "MinCut", "Ortho"]:
-            x = x.to_dense()
-        # store sparse features in CSR format; a product with a COO matrix converts it to CSR on every call
-        if x.is_sparse:
-            x = x.coalesce().to_sparse_csr()
 
         for lr in lrs:
             trial  = 0
@@ -286,21 +524,16 @@ class Cluster(torch.nn.Module):
                     while epoch < epochs and no_improvement < patience:
                         self.train()
                         optimizer.zero_grad()
-
-                        loss, s = self.forward(x = x)
-                        loss += self.extra_regularisation()
-
-                        if len(torch.nonzero(torch.isnan(s))) > 0:
-                            raise Exception("Ran into nans.")
-
-                        loss.backward()
+                        # release the last eval's assignment before the backward pass; s_best keeps the best one
+                        s = None
+                        self._gradient(x)
                         optimizer.step()
                         if lr_schedule:
                             scheduler.step()
 
                         self.eval()
                         with torch.no_grad():
-                            loss, s = self.forward(x = x)
+                            loss, s = self.objective(x, self._encode(x))
 
                             if verbose:
                                 num_communities = len(set(s.argmax(dim = 1).cpu().numpy()))
@@ -385,31 +618,27 @@ class Neuromap(Cluster):
         torch.nn.init.zeros_(self.t)
 
 
-    def forward(self, x):
-        s = softmax(self.model(x) / sigmoid(self.t), dim = 1)
+    def objective(self, x, z):
+        s = softmax(z / sigmoid(self.t), dim = 1)
 
-        # the pool gets the features stored in fit, so NeuromapD's dropout does not reach x_pooled
+        # the pool gets the features in the layout that _prepare stores for it
         _, _, loss = self.pool(x = self.pool_x, s = s)
 
         return loss, s
 
 
-    def fit( self
-           , data        : Data
-           , epochs      : int         = 10000
-           , patience    : int         =   100
-           , lrs         : List[float] = [10**(-3)]
-           , lr_schedule : bool        = False
-           , num_trials  : int         =     1
-           , verbose     : bool        = False
-           ):
-        self.data = data.to(device = self.device)
-        self.pool = MapEquationPooling(adj = self.data.edge_index)
+    def _prepare(self, data: Data, batch_size: Maybe[int]) -> Tensor:
+        x = super()._prepare(data, batch_size)
+        self.pool = MapEquationPooling(adj = self.data.edge_index, chunk_size = batch_size)
 
         # store sparse features in CSC format for the pool; then x.t() is x^T in CSR format, without a copy
-        self.pool_x = self.data.x.coalesce().to_sparse_csc() if self.data.x.is_sparse else self.data.x
+        # in batched training, the pool takes the rows of the features in CPU memory
+        if batch_size is None:
+            self.pool_x = self.data.x.coalesce().to_sparse_csc() if self.data.x.is_sparse else self.data.x
+        else:
+            self.pool_x = x
 
-        return super().fit(data = data, epochs = epochs, patience = patience, lrs = lrs, lr_schedule = lr_schedule, num_trials = num_trials, verbose = verbose)
+        return x
 
 
 class NeuromapD(Neuromap):
@@ -439,14 +668,23 @@ class NeuromapD(Neuromap):
                         , **kwargs
                         )
     
-    def forward(self, x):
+    def encode(self, x, adjs = None):
         # dropout does not support sparse tensors, so drop the stored entries of a sparse x
         # dropout leaves zeros at zero, so this is the same as dropout on the dense x
+        # in batched training, the masks are keyed by node and feature, so that a node's features get the same mask in every batch
+        batch   = self.model.batch
+        batched = batch.n_id is not None and self.training
         if x.layout == torch.sparse_csr:
-            x = torch.sparse_csr_tensor(x.crow_indices(), x.col_indices(), torch.nn.functional.dropout(x.values(), p = self.dropout, training = self.training), x.shape)
+            if batched:
+                values = keyed_dropout(x.values()[:, None], self.dropout, batch, torch.repeat_interleave(batch.n_id, x.crow_indices().diff()), x.col_indices())[:, 0]
+            else:
+                values = torch.nn.functional.dropout(x.values(), p = self.dropout, training = self.training)
+            x = torch.sparse_csr_tensor(x.crow_indices(), x.col_indices(), values, x.shape)
+        elif batched:
+            x = keyed_dropout(x, self.dropout, batch, batch.n_id)
         else:
             x = torch.nn.functional.dropout(x, p = self.dropout, training = self.training)
-        return super().forward(x)
+        return super().encode(x, adjs)
 
 
 class DMoN(Cluster):
@@ -480,15 +718,14 @@ class DMoN(Cluster):
         super()._reset()
         self.pool = DMoNPooling(channels = [self.out_channels, self.out_channels], k = self.out_channels, dropout = self.dropout).to(device = self.device)
 
-    def forward(self, x):
-        x = self.model(x)
-        x, _, adj, sp, o, c = self.pool(x = x, adj = self.data.edge_index)
-        x = x[0]
+    def objective(self, x, z):
+        s, _, adj, sp, o, c = self.pool(x = z, adj = self.data.edge_index)
+        s = s[0]
         # do not use orthogonality loss as per the original implementation
         # https://github.com/google-research/google-research/blob/master/graph_embedding/dmon/dmon.py
         loss = sp + c
 
-        return loss, x
+        return loss, s
 
 
 class DiffPool(Cluster):
@@ -518,12 +755,11 @@ class DiffPool(Cluster):
                         , **kwargs
                         )
     
-    def forward(self, x):
-        s = self.model(x)
-        _, adj, l, e = diff_pool(x = x, adj = self.data.edge_index, s = s)
+    def objective(self, x, z):
+        _, adj, l, e = diff_pool(x = x, adj = self.data.edge_index, s = z, chunk_size = self.batch_size)
         loss = l + e
 
-        return loss, softmax(s)
+        return loss, softmax(z)
 
 
 class MinCut(Cluster):
@@ -553,12 +789,11 @@ class MinCut(Cluster):
                         , **kwargs
                         )
     
-    def forward(self, x):
-        s = self.model(x)
-        _, adj, mc, o = mincut_pool(x = x, adj = self.data.edge_index, s = s)
+    def objective(self, x, z):
+        _, adj, mc, o = mincut_pool(x = x, adj = self.data.edge_index, s = z, chunk_size = self.batch_size)
         loss = mc + o
 
-        return loss, softmax(s)
+        return loss, softmax(z)
 
 
 class Ortho(Cluster):
@@ -588,11 +823,10 @@ class Ortho(Cluster):
                         , **kwargs
                         )
     
-    def forward(self, x):
-        s = self.model(x)
-        _, adj, mc, o = mincut_pool(x = x, adj = self.data.edge_index, s = s)
+    def objective(self, x, z):
+        _, adj, mc, o = mincut_pool(x = x, adj = self.data.edge_index, s = z, chunk_size = self.batch_size)
         loss = o
-        s = softmax(s)
+        s = softmax(z)
 
         return loss, softmax(s)
 
@@ -636,27 +870,52 @@ class NOCD(Cluster):
                         , **kwargs
                         )
     
-    def forward(self, x):
-        x = relu(self.model(x))
-        loss = self.nocd_decoder.loss_full(x, self.A)
+    def objective(self, x, z):
+        z = relu(z)
+        loss = self.nocd_decoder.loss_full(z, self.A) if self.batch_size is None else self._loss_in_chunks(z)
 
-        return loss, x
+        return loss, z
+
+    def _link_sums(self, emb, e1, e2):
+        # loss_full's two sums over the links from e1 to e2
+        edge_dots = torch.sum(emb[e1] * emb[e2], dim = 1)
+        return -torch.sum(torch.log(-torch.expm1(-self.nocd_decoder.eps - edge_dots))), torch.sum(edge_dots)
+
+    def _loss_in_chunks(self, emb):
+        """
+        BerpoDecoder.loss_full, with its sums over the links taken in chunks of links.
+        loss_full multiplies the embeddings of all links' nodes at once, which takes E × K memory.
+        checkpoint recomputes each chunk in the backward pass, so only one chunk's products are in memory at a time.
+        """
+        decoder = self.nocd_decoder
+
+        loss_edges, edge_dots = 0, 0
+        for start, end in self.link_chunks:
+            loss_chunk, edge_dots_chunk = checkpoint(self._link_sums, emb, self.e1[start:end], self.e2[start:end], use_reentrant = False)
+            loss_edges = loss_edges + loss_chunk
+            edge_dots  = edge_dots  + edge_dots_chunk
+
+        # the rest as in loss_full, whose neg_scale is 1, because _prepare sets balance_loss
+        correction    = torch.sum(emb * emb) + edge_dots
+        loss_nonedges = torch.sum(emb @ torch.sum(emb, dim = 0, keepdim = True).t()) - correction
+        return (loss_edges / decoder.num_edges + loss_nonedges / decoder.num_nonedges) / 2
 
     def extra_regularisation(self) -> float:
         weight_decay = 1e-2    # strength of L2 regularization on GNN weights
         return nocd.utils.l2_reg_loss(ModelWrapper(self.model), scale = weight_decay)
 
-    def fit( self
-           , data        : Data
-           , epochs      : int         = 10000
-           , patience    : int         =   100
-           , lrs         : List[float] = [10**(-3)]
-           , lr_schedule : bool        = False
-           , num_trials  : int         =     1
-           , verbose     : bool        = False
-           ):
-        self.data = data.to(device = self.device)
-        self.A = to_scipy_sparse_matrix(edge_index = data.edge_index.indices(), edge_attr = data.edge_index.values())
+    def _prepare(self, data: Data, batch_size: Maybe[int]) -> Tensor:
+        x = super()._prepare(data, batch_size)
+        self.A = to_scipy_sparse_matrix(edge_index = self.data.edge_index.indices(), edge_attr = self.data.edge_index.values())
         # data.num_edges assumes edge_index has shape [2, num_edges]; here it is the sparse adjacency, so count its stored entries
         self.nocd_decoder = nocd.nn.BerpoDecoder(self.data.num_nodes, self.A.nnz, balance_loss=True)
-        return super().fit(data = data, epochs = epochs, patience = patience, lrs = lrs, lr_schedule = lr_schedule, num_trials = num_trials, verbose = verbose)
+
+        if batch_size is not None:
+            # chunks of as many links as a batch's nodes have on average
+            e1, e2  = self.A.nonzero()
+            self.e1 = torch.as_tensor(e1, dtype = torch.long, device = self.device)
+            self.e2 = torch.as_tensor(e2, dtype = torch.long, device = self.device)
+            step    = -(-len(e1) // len(self.batches))
+            self.link_chunks = [(start, min(start + step, len(e1))) for start in range(0, len(e1), step)]
+
+        return x
