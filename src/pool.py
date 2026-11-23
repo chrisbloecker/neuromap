@@ -31,8 +31,8 @@ def pool_features(s: Tensor, x: Tensor, chunk_size: int) -> Tensor:
 # they are changed where adj is a sparse matrix, in CSR format for mincut_pool and DMoNPooling, where x stays in CPU memory in batched training, and in DiffPool's link loss
 # they make the identity matrix on the assignments' device instead of on the CPU
 # they leave out what no loss in training.py uses and return None in its place:
-# the pooled features, the pooled adjacency matrix of mincut_pool and DMoNPooling, and DMoN's orthogonality loss
-# mincut_pool and DMoNPooling take the traces in their losses as sums of elementwise products, without the K × K matrices
+# the pooled features, the pooled adjacency matrix and DMoN's orthogonality loss
+# diff_pool, mincut_pool and DMoNPooling take the traces in their losses as sums of elementwise products, without the K × K matrices
 # each changed line has PyG's version as a comment above it
 def diff_pool(
     x: Tensor,
@@ -108,17 +108,16 @@ def diff_pool(
         mask = mask.view(batch_size, num_nodes, 1).to(x.dtype)
         x, s = x * mask, s * mask
 
-    # no loss uses the pooled features, so they are not computed
+    # no loss uses the pooled features and the pooled adjacency matrix, so they are not computed
     # out = torch.matmul(s.transpose(1, 2), x)
     # out_adj = torch.matmul(torch.matmul(s.transpose(1, 2), adj), s)
-    out_adj = s[0].T @ torch.sparse.mm(adj[0], s[0])
-    out_adj = out_adj[None, :, :]
 
     # link_loss = adj - torch.matmul(s, s.transpose(1, 2))
     # link_loss = torch.norm(link_loss, p=2)
     # ‖A − s sᵀ‖² = ‖A‖² − 2 tr(sᵀ A s) + ‖sᵀ s‖², which needs no N × N matrix
+    # tr(sᵀ A s) is the sum of s ⊙ (A s), which needs no K × K matrix either
     # unsqueeze drops adj's coalesced flag, so read its stored entries with _values; callers store adj coalesced, so the entries are distinct
-    link_loss = torch.sqrt(torch.sum(adj._values()**2) - 2 * torch.sum(_rank3_trace(out_adj)) + torch.sum(torch.matmul(s.transpose(1, 2), s)**2))
+    link_loss = torch.sqrt(torch.sum(adj._values()**2) - 2 * torch.sum(s[0] * torch.sparse.mm(adj[0], s[0])) + torch.sum(torch.matmul(s.transpose(1, 2), s)**2))
     if normalize is True:
         link_loss = link_loss / adj.numel()
 
@@ -239,10 +238,6 @@ def mincut_pool(
 
     # return out, out_adj, mincut_loss, ortho_loss
     return None, None, mincut_loss, ortho_loss
-
-
-def _rank3_trace(x: Tensor) -> Tensor:
-    return torch.einsum("ijj->i", x)
 
 
 def orthogonality_loss(s: Tensor) -> Tensor:
