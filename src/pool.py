@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import List, Callable, Optional, Tuple, Union
 
+import math
 import torch
 from torch import Tensor
 from torch.nn import Parameter
@@ -29,7 +30,8 @@ def pool_features(s: Tensor, x: Tensor, chunk_size: int) -> Tensor:
 
 # diff_pool, mincut_pool and DMoNPooling are dense_diff_pool, dense_mincut_pool and DMoNPooling from PyG 2.8.1
 # they are changed where adj is a sparse matrix, in CSR format for mincut_pool and DMoNPooling, where x stays in CPU memory in batched training, and in DiffPool's link loss
-# they make the identity matrix on the assignments' device instead of on the CPU
+# mincut_pool's orthogonality loss makes the identity matrix on the assignments' device instead of on the CPU
+# DMoNPooling's cluster loss takes the identity's norm as √C, without the identity
 # they leave out what no loss in training.py uses and return None in its place:
 # the pooled features, the pooled adjacency matrix and DMoN's orthogonality loss
 # diff_pool, mincut_pool and DMoNPooling take the traces in their losses as sums of elementwise products, without the K × K matrices
@@ -194,7 +196,7 @@ def mincut_pool(
     # x = x.unsqueeze(0) if x.dim() == 2 else x
     x = x.unsqueeze(0) if x.dim() == 2 and chunk_size is None else x
     # adj = adj.unsqueeze(0) if adj.dim() == 2 else adj
-    # adj stays a 2D matrix in CSR format, which has no 3D form
+    # adj stays a 2D matrix in CSR format, because torch cannot unsqueeze a CSR matrix
     s = s.unsqueeze(0) if s.dim() == 2 else s
 
     # (batch_size, num_nodes, _), k = x.size(), s.size(-1)
@@ -352,7 +354,7 @@ class DMoNPooling(torch.nn.Module):
         """
         x = x.unsqueeze(0) if x.dim() == 2 else x
         # adj = adj.unsqueeze(0) if adj.dim() == 2 else adj
-        # adj stays a 2D matrix in CSR format, which has no 3D form
+        # adj stays a 2D matrix in CSR format, because torch cannot unsqueeze a CSR matrix
 
         s = self.mlp(x)
         s = F.dropout(s, self.dropout, training=self.training)
@@ -396,8 +398,6 @@ class DMoNPooling(torch.nn.Module):
         # DMoN leaves the orthogonality loss out of its loss, as the original implementation does, so it is not computed
         # ss = torch.matmul(s.transpose(1, 2), s)
         # i_s = torch.eye(C).type_as(ss)
-        # make the identity on s's device, instead of on the CPU and copying it over in every call
-        i_s = torch.eye(C, dtype=s.dtype, device=s.device)
         # ortho_loss = torch.norm(
         #     ss / torch.norm(ss, dim=(-1, -2), keepdim=True) - i_s / torch.norm(i_s),
         #     dim=(-1, -2),
@@ -407,7 +407,9 @@ class DMoNPooling(torch.nn.Module):
         # Cluster loss:
         cluster_size = torch.einsum("ijk->ik", s)  # B x C
         cluster_loss = torch.norm(input=cluster_size, dim=1)
-        cluster_loss = cluster_loss / mask.sum(dim=1) * torch.norm(i_s) - 1
+        # cluster_loss = cluster_loss / mask.sum(dim=1) * torch.norm(i_s) - 1
+        # the norm of the C × C identity is √C, so the identity is not built
+        cluster_loss = cluster_loss / mask.sum(dim=1) * math.sqrt(C) - 1
         cluster_loss = cluster_loss.mean()
 
         # no loss uses the coarsened adjacency matrix, so it is not fixed and normalized

@@ -296,7 +296,8 @@ class Cluster(torch.nn.Module):
             if self.use_model in ["gin", "sage"]:
                 x = x.to_dense()
             # DiffPool, MinCut and Ortho take dense features, whatever the model
-            # their losses no longer use x, but sparse features would change their results by rounding
+            # diff_pool and mincut_pool unsqueeze x, which fails on a CSR matrix
+            # with sparse features, Ortho's results would change by rounding
             if self._get_name() in ["DiffPool", "MinCut", "Ortho"]:
                 x = x.to_dense()
             # store sparse features in CSR format; a product with a COO matrix converts it to CSR on every call
@@ -831,9 +832,9 @@ class Ortho(Cluster):
                         )
     
     def objective(self, x, z):
-        # Ortho's loss is mincut_pool's orthogonality loss, so compute only that, on mincut_pool's softmax of z
-        loss = orthogonality_loss(torch.softmax(z.unsqueeze(0), dim = -1))
-        s = softmax(z)
+        s = softmax(z, dim = 1)
+        # Ortho's loss is mincut_pool's orthogonality loss, so compute only that
+        loss = orthogonality_loss(s.unsqueeze(0))
 
         return loss, softmax(s)
 
