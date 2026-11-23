@@ -13,8 +13,7 @@ from torch_geometric.utils import to_scipy_sparse_matrix
 from torch_geometric.data  import Data
 from torch.nn.functional   import softmax, sigmoid, relu
 from torch.nn              import Parameter
-from torch.utils.checkpoint import checkpoint
-from pool                  import DMoNPooling, mincut_pool, diff_pool, pool_features
+from pool                 import DMoNPooling, mincut_pool, diff_pool, pool_features, orthogonality_loss
 
 import gc
 
@@ -296,7 +295,9 @@ class Cluster(torch.nn.Module):
             x = self.data.x
             if self.use_model in ["gin", "sage"]:
                 x = x.to_dense()
-            # DiffPool, MinCut and Ortho pool x with dense products, whatever the model
+            # DiffPool, MinCut and Ortho take dense features, whatever the model
+            # diff_pool and mincut_pool unsqueeze x, which fails on a CSR matrix
+            # with sparse features, Ortho's results would change by rounding
             if self._get_name() in ["DiffPool", "MinCut", "Ortho"]:
                 x = x.to_dense()
             # store sparse features in CSR format; a product with a COO matrix converts it to CSR on every call
@@ -717,9 +718,11 @@ class DMoN(Cluster):
     def _reset(self):
         super()._reset()
         self.pool = DMoNPooling(channels = [self.out_channels, self.out_channels], k = self.out_channels, dropout = self.dropout).to(device = self.device)
+        # the adjacency in CSR format, which DMoNPooling takes; a product with a COO matrix converts it to CSR on every call
+        self.adj = self.data.edge_index.coalesce().to_sparse_csr()
 
     def objective(self, x, z):
-        s, _, adj, sp, o, c = self.pool(x = z, adj = self.data.edge_index)
+        s, _, _, sp, _, c = self.pool(x = z, adj = self.adj)
         s = s[0]
         # do not use orthogonality loss as per the original implementation
         # https://github.com/google-research/google-research/blob/master/graph_embedding/dmon/dmon.py
@@ -756,7 +759,7 @@ class DiffPool(Cluster):
                         )
     
     def objective(self, x, z):
-        _, adj, l, e = diff_pool(x = x, adj = self.data.edge_index, s = z, chunk_size = self.batch_size)
+        _, _, l, e = diff_pool(x = x, adj = self.data.edge_index, s = z, chunk_size = self.batch_size)
         loss = l + e
 
         return loss, softmax(z)
@@ -789,8 +792,13 @@ class MinCut(Cluster):
                         , **kwargs
                         )
     
+    def _reset(self):
+        super()._reset()
+        # the adjacency in CSR format, which mincut_pool takes; a product with a COO matrix converts it to CSR on every call
+        self.adj = self.data.edge_index.coalesce().to_sparse_csr()
+
     def objective(self, x, z):
-        _, adj, mc, o = mincut_pool(x = x, adj = self.data.edge_index, s = z, chunk_size = self.batch_size)
+        _, _, mc, o = mincut_pool(x = x, adj = self.adj, s = z, chunk_size = self.batch_size)
         loss = mc + o
 
         return loss, softmax(z)
@@ -824,9 +832,9 @@ class Ortho(Cluster):
                         )
     
     def objective(self, x, z):
-        _, adj, mc, o = mincut_pool(x = x, adj = self.data.edge_index, s = z, chunk_size = self.batch_size)
-        loss = o
-        s = softmax(z)
+        s = softmax(z, dim = 1)
+        # Ortho's loss is mincut_pool's orthogonality loss, so compute only that
+        loss = orthogonality_loss(s.unsqueeze(0))
 
         return loss, softmax(s)
 
@@ -842,6 +850,29 @@ class ModelWrapper:
     def get_biases(self):
         """Return the bias vectors of the model."""
         return [w for n, w in self.model.named_parameters() if "bias" in n]
+
+
+class LinkDots(torch.autograd.Function):
+    """
+    The dot products of the embeddings of each link's two nodes, at adj's stored entries, in adj's CSR order.
+    sampled_addmm's own backward converts the transposed gradient to CSR in every call, which sorts it, waits for the GPU and takes more memory.
+    This backward takes the transposed gradient's entries from the gradient in the order that _prepare builds once, with the transpose's structure.
+    """
+    @staticmethod
+    def forward(ctx, emb, adj, adj_t_crow, adj_t_col, transposed_order):
+        ctx.save_for_backward(emb)
+        ctx.links = (adj, adj_t_crow, adj_t_col, transposed_order)
+        return torch.sparse.sampled_addmm(adj, emb, emb.t(), beta = 0.0).values()
+
+    @staticmethod
+    def backward(ctx, g):
+        emb, = ctx.saved_tensors
+        adj, adj_t_crow, adj_t_col, transposed_order = ctx.links
+        # each link's gradient reaches both of its nodes, through the embedding at its other end
+        G   = torch.sparse_csr_tensor(adj.crow_indices(), adj.col_indices(), g, adj.shape)
+        G_t = torch.sparse_csr_tensor(adj_t_crow, adj_t_col, g[transposed_order], adj.shape)
+        # add the second product in place, so that only one N × K matrix is allocated
+        return (G @ emb).addmm_(G_t, emb), None, None, None, None
 
 class NOCD(Cluster):
     def __init__( self
@@ -872,31 +903,23 @@ class NOCD(Cluster):
     
     def objective(self, x, z):
         z = relu(z)
-        loss = self.nocd_decoder.loss_full(z, self.A) if self.batch_size is None else self._loss_in_chunks(z)
+        loss = self._loss(z)
 
         return loss, z
 
-    def _link_sums(self, emb, e1, e2):
-        # loss_full's two sums over the links from e1 to e2
-        edge_dots = torch.sum(emb[e1] * emb[e2], dim = 1)
-        return -torch.sum(torch.log(-torch.expm1(-self.nocd_decoder.eps - edge_dots))), torch.sum(edge_dots)
-
-    def _loss_in_chunks(self, emb):
+    def _loss(self, emb):
         """
-        BerpoDecoder.loss_full, with its sums over the links taken in chunks of links.
-        loss_full multiplies the embeddings of all links' nodes at once, which takes E × K memory.
-        checkpoint recomputes each chunk in the backward pass, so only one chunk's products are in memory at a time.
+        BerpoDecoder.loss_full, with the dot products of linked nodes' embeddings taken only at the links, by torch.sparse.sampled_addmm.
+        loss_full gathers both embeddings of every link, an E × K matrix, which is slow and takes E × K memory.
         """
         decoder = self.nocd_decoder
-
-        loss_edges, edge_dots = 0, 0
-        for start, end in self.link_chunks:
-            loss_chunk, edge_dots_chunk = checkpoint(self._link_sums, emb, self.e1[start:end], self.e2[start:end], use_reentrant = False)
-            loss_edges = loss_edges + loss_chunk
-            edge_dots  = edge_dots  + edge_dots_chunk
+        # e1, e2 = adj.nonzero()
+        # edge_dots = torch.sum(emb[e1] * emb[e2], dim=1)
+        edge_dots  = LinkDots.apply(emb, self.adj, self.adj_t_crow, self.adj_t_col, self.transposed_order)
+        loss_edges = -torch.sum(torch.log(-torch.expm1(-decoder.eps - edge_dots)))
 
         # the rest as in loss_full, whose neg_scale is 1, because _prepare sets balance_loss
-        correction    = torch.sum(emb * emb) + edge_dots
+        correction    = torch.sum(emb * emb) + torch.sum(edge_dots)
         loss_nonedges = torch.sum(emb @ torch.sum(emb, dim = 0, keepdim = True).t()) - correction
         return (loss_edges / decoder.num_edges + loss_nonedges / decoder.num_nonedges) / 2
 
@@ -906,16 +929,14 @@ class NOCD(Cluster):
 
     def _prepare(self, data: Data, batch_size: Maybe[int]) -> Tensor:
         x = super()._prepare(data, batch_size)
-        self.A = to_scipy_sparse_matrix(edge_index = self.data.edge_index.indices(), edge_attr = self.data.edge_index.values())
+        # the links in CSR format, at which _loss takes the dot products of the linked nodes' embeddings
+        self.adj = self.data.edge_index.coalesce().to_sparse_csr()
+        # for LinkDots's backward: the transpose's structure in CSR format, and the order that takes adj's stored entries to the transpose's
+        # transposing a matrix whose stored values are their own positions gives that order
+        positions = torch.sparse_coo_tensor(self.data.edge_index.coalesce().indices(), torch.arange(self.adj._nnz(), dtype = torch.float64, device = self.device), self.adj.shape)
+        positions_t = positions.t().coalesce().to_sparse_csr()
+        self.adj_t_crow, self.adj_t_col, self.transposed_order = positions_t.crow_indices(), positions_t.col_indices(), positions_t.values().long()
         # data.num_edges assumes edge_index has shape [2, num_edges]; here it is the sparse adjacency, so count its stored entries
-        self.nocd_decoder = nocd.nn.BerpoDecoder(self.data.num_nodes, self.A.nnz, balance_loss=True)
-
-        if batch_size is not None:
-            # chunks of as many links as a batch's nodes have on average
-            e1, e2  = self.A.nonzero()
-            self.e1 = torch.as_tensor(e1, dtype = torch.long, device = self.device)
-            self.e2 = torch.as_tensor(e2, dtype = torch.long, device = self.device)
-            step    = -(-len(e1) // len(self.batches))
-            self.link_chunks = [(start, min(start + step, len(e1))) for start in range(0, len(e1), step)]
+        self.nocd_decoder = nocd.nn.BerpoDecoder(self.data.num_nodes, self.adj._nnz(), balance_loss=True)
 
         return x

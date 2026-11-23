@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import List, Callable, Optional, Tuple, Union
 
+import math
 import torch
 from torch import Tensor
 from torch.nn import Parameter
@@ -28,7 +29,12 @@ def pool_features(s: Tensor, x: Tensor, chunk_size: int) -> Tensor:
 
 
 # diff_pool, mincut_pool and DMoNPooling are dense_diff_pool, dense_mincut_pool and DMoNPooling from PyG 2.8.1
-# they are changed where adj is a sparse matrix, where x stays in CPU memory in batched training, and in DiffPool's link loss
+# they are changed where adj is a sparse matrix, in CSR format for mincut_pool and DMoNPooling, where x stays in CPU memory in batched training, and in DiffPool's link loss
+# mincut_pool's orthogonality loss makes the identity matrix on the assignments' device instead of on the CPU
+# DMoNPooling's cluster loss takes the identity's norm as √C, without the identity
+# they leave out what no loss in training.py uses and return None in its place:
+# the pooled features, the pooled adjacency matrix and DMoN's orthogonality loss
+# diff_pool, mincut_pool and DMoNPooling take the traces in their losses as sums of elementwise products, without the K × K matrices
 # each changed line has PyG's version as a comment above it
 def diff_pool(
     x: Tensor,
@@ -82,9 +88,10 @@ def diff_pool(
         normalize (bool, optional): If set to :obj:`False`, the link
             prediction loss is not divided by :obj:`adj.numel()`.
             (default: :obj:`True`)
-        chunk_size (int, optional): In batched training, :obj:`x` stays in
-            CPU memory, and the pooled features are computed from
-            :obj:`chunk_size` of its rows at a time. (default: :obj:`None`)
+        chunk_size (int, optional): Set in batched training, where
+            :obj:`x` stays in CPU memory and can be a CSR matrix, which
+            cannot be unsqueezed. Then :obj:`x` is left as it is.
+            (default: :obj:`None`)
 
     :rtype: (:class:`torch.Tensor`, :class:`torch.Tensor`,
         :class:`torch.Tensor`, :class:`torch.Tensor`)
@@ -103,23 +110,23 @@ def diff_pool(
         mask = mask.view(batch_size, num_nodes, 1).to(x.dtype)
         x, s = x * mask, s * mask
 
+    # no loss uses the pooled features and the pooled adjacency matrix, so they are not computed
     # out = torch.matmul(s.transpose(1, 2), x)
-    out = torch.matmul(s.transpose(1, 2), x) if chunk_size is None else pool_features(s[0], x, chunk_size)[None]
     # out_adj = torch.matmul(torch.matmul(s.transpose(1, 2), adj), s)
-    out_adj = s[0].T @ torch.sparse.mm(adj[0], s[0])
-    out_adj = out_adj[None, :, :]
 
     # link_loss = adj - torch.matmul(s, s.transpose(1, 2))
     # link_loss = torch.norm(link_loss, p=2)
     # ‖A − s sᵀ‖² = ‖A‖² − 2 tr(sᵀ A s) + ‖sᵀ s‖², which needs no N × N matrix
+    # tr(sᵀ A s) is the sum of s ⊙ (A s), which needs no K × K matrix either
     # unsqueeze drops adj's coalesced flag, so read its stored entries with _values; callers store adj coalesced, so the entries are distinct
-    link_loss = torch.sqrt(torch.sum(adj._values()**2) - 2 * torch.sum(_rank3_trace(out_adj)) + torch.sum(torch.matmul(s.transpose(1, 2), s)**2))
+    link_loss = torch.sqrt(torch.sum(adj._values()**2) - 2 * torch.sum(s[0] * torch.sparse.mm(adj[0], s[0])) + torch.sum(torch.matmul(s.transpose(1, 2), s)**2))
     if normalize is True:
         link_loss = link_loss / adj.numel()
 
     ent_loss = (-s * torch.log(s + 1e-15)).sum(dim=-1).mean()
 
-    return out, out_adj, link_loss, ent_loss
+    # return out, out_adj, link_loss, ent_loss
+    return None, None, link_loss, ent_loss
 
 
 def mincut_pool(
@@ -177,9 +184,10 @@ def mincut_pool(
             the valid nodes for each graph. (default: :obj:`None`)
         temp (float, optional): Temperature parameter for softmax function.
             (default: :obj:`1.0`)
-        chunk_size (int, optional): In batched training, :obj:`x` stays in
-            CPU memory, and the pooled features are computed from
-            :obj:`chunk_size` of its rows at a time. (default: :obj:`None`)
+        chunk_size (int, optional): Set in batched training, where
+            :obj:`x` stays in CPU memory and can be a CSR matrix, which
+            cannot be unsqueezed. Then :obj:`x` is left as it is.
+            (default: :obj:`None`)
 
     :rtype: (:class:`torch.Tensor`, :class:`torch.Tensor`,
         :class:`torch.Tensor`, :class:`torch.Tensor`)
@@ -187,7 +195,8 @@ def mincut_pool(
 
     # x = x.unsqueeze(0) if x.dim() == 2 else x
     x = x.unsqueeze(0) if x.dim() == 2 and chunk_size is None else x
-    adj = adj.unsqueeze(0) if adj.dim() == 2 else adj
+    # adj = adj.unsqueeze(0) if adj.dim() == 2 else adj
+    # adj stays a 2D matrix in CSR format, because torch cannot unsqueeze a CSR matrix
     s = s.unsqueeze(0) if s.dim() == 2 else s
 
     # (batch_size, num_nodes, _), k = x.size(), s.size(-1)
@@ -199,63 +208,58 @@ def mincut_pool(
         mask = mask.view(batch_size, num_nodes, 1).to(x.dtype)
         x, s = x * mask, s * mask
 
+    # no loss uses the pooled features, so they are not computed
     # out = torch.matmul(s.transpose(1, 2), x)
-    out = torch.matmul(s.transpose(1, 2), x) if chunk_size is None else pool_features(s[0], x, chunk_size)[None]
+    # the MinCut loss needs only the traces of sᵀ A s and sᵀ D s, which are the sums of s ⊙ (A s) and s ⊙ (D s)
+    # so neither K × K matrix is computed
     # out_adj = torch.matmul(torch.matmul(s.transpose(1, 2), adj), s)
-    out_adj = s[0].T @ torch.sparse.mm(adj[0], s[0])
-    out_adj = out_adj[None, :, :]
 
     # MinCut regularization.
-    mincut_num = _rank3_trace(out_adj)
-    d_flat = torch.einsum("ijk->ij", adj)
-    d = _rank3_diag(d_flat)
+    # mincut_num = _rank3_trace(out_adj)
+    mincut_num = torch.sum(s[0] * (adj @ s[0]))
+    # d_flat = torch.einsum("ijk->ij", adj)
+    d_flat = adj @ torch.ones(num_nodes, 1, dtype=s.dtype, device=s.device)
+    # d = _rank3_diag(d_flat)
     # mincut_den = _rank3_trace(torch.matmul(torch.matmul(s.transpose(1, 2), d), s))
-    mincut_den = _rank3_trace(
-        torch.sparse.mm(torch.sparse.mm(d[0], s[0]).T, s[0]).unsqueeze(0)
-    )
+    mincut_den = torch.sum(s[0] * (d_flat * s[0]))
     mincut_loss = -(mincut_num / mincut_den)
     mincut_loss = torch.mean(mincut_loss)
 
-    # Orthogonality regularization.
+    # Orthogonality regularization, in orthogonality_loss, which Ortho uses alone.
+    ortho_loss = orthogonality_loss(s)
+
+    # no loss uses the coarsened adjacency matrix, so it is not fixed and normalized
+    # EPS = 1e-15
+    #
+    # # Fix and normalize coarsened adjacency matrix.
+    # ind = torch.arange(k, device=out_adj.device)
+    # out_adj[:, ind, ind] = 0
+    # d = torch.einsum("ijk->ij", out_adj)
+    # d = torch.sqrt(d)[:, None] + EPS
+    # out_adj = (out_adj / d) / d.transpose(1, 2)
+
+    # return out, out_adj, mincut_loss, ortho_loss
+    return None, None, mincut_loss, ortho_loss
+
+
+def orthogonality_loss(s: Tensor) -> Tensor:
+    """
+    mincut_pool's orthogonality loss, for the assignments s after the softmax, B × N × K.
+    Ortho uses it without the rest of mincut_pool.
+    """
+    k = s.size(-1)
+
     ss = torch.matmul(s.transpose(1, 2), s)
-    i_s = torch.eye(k).type_as(ss)
+    # i_s = torch.eye(k).type_as(ss)
+    # make the identity on ss's device, instead of on the CPU and copying it over in every call
+    i_s = torch.eye(k, dtype=ss.dtype, device=ss.device)
     ortho_loss = torch.norm(
         ss / torch.norm(ss, dim=(-1, -2), keepdim=True) - i_s / torch.norm(i_s),
         dim=(-1, -2),
     )
     ortho_loss = torch.mean(ortho_loss)
 
-    EPS = 1e-15
-
-    # Fix and normalize coarsened adjacency matrix.
-    ind = torch.arange(k, device=out_adj.device)
-    out_adj[:, ind, ind] = 0
-    d = torch.einsum("ijk->ij", out_adj)
-    d = torch.sqrt(d)[:, None] + EPS
-    out_adj = (out_adj / d) / d.transpose(1, 2)
-
-    return out, out_adj, mincut_loss, ortho_loss
-
-
-def _rank3_trace(x: Tensor) -> Tensor:
-    return torch.einsum("ijj->i", x)
-
-
-def _rank3_diag(x: Tensor) -> Tensor:
-    # eye = torch.eye(x.size(1)).type_as(x)
-    # out = eye * x.unsqueeze(2).expand(x.size(0), x.size(1), x.size(1))
-    n = x.size(1)
-    indices = torch.stack((torch.arange(n), torch.arange(n))).to(x.device)
-    out = (
-        torch.sparse_coo_tensor(indices, x[0].to_dense(), (n, n))
-        .to(x.device)
-        .unsqueeze(0)
-    )
-
-    return out
-
-
-EPS = 1e-15
+    return ortho_loss
 
 
 class DMoNPooling(torch.nn.Module):
@@ -349,7 +353,8 @@ class DMoNPooling(torch.nn.Module):
             :class:`torch.Tensor`, :class:`torch.Tensor`)
         """
         x = x.unsqueeze(0) if x.dim() == 2 else x
-        adj = adj.unsqueeze(0) if adj.dim() == 2 else adj
+        # adj = adj.unsqueeze(0) if adj.dim() == 2 else adj
+        # adj stays a 2D matrix in CSR format, because torch cannot unsqueeze a CSR matrix
 
         s = self.mlp(x)
         s = F.dropout(s, self.dropout, training=self.training)
@@ -361,53 +366,62 @@ class DMoNPooling(torch.nn.Module):
             mask = torch.ones(batch_size, num_nodes, dtype=torch.bool, device=x.device)
 
         mask = mask.view(batch_size, num_nodes, 1).to(x.dtype)
-        x, s = x * mask, s * mask
+        # x, s = x * mask, s * mask
+        s = s * mask
 
-        out = F.selu(torch.matmul(s.transpose(1, 2), x))
+        # no loss uses the pooled features, so they are not computed
+        # out = F.selu(torch.matmul(s.transpose(1, 2), x))
+        # the spectral loss needs only the trace of the pooled adjacency matrix, which is the sum of s ⊙ (A s)
+        # so the K × K matrix is not computed
         # out_adj = torch.matmul(torch.matmul(s.transpose(1, 2), adj), s)
-        out_adj = s[0].T @ torch.sparse.mm(adj[0], s[0])
-        out_adj = out_adj[None, :, :]
 
         # Spectral loss:
         # degrees = torch.einsum("ijk->ij", adj)  # B X N
-        degrees = torch.einsum("ijk->ij", adj).to_dense()  # B X N
+        degrees = (adj @ torch.ones(num_nodes, 1, dtype=s.dtype, device=s.device)).T  # B X N
         degrees = degrees.unsqueeze(-1) * mask  # B x N x 1
         degrees_t = degrees.transpose(1, 2)  # B x 1 x N
 
         m = torch.einsum("ijk->i", degrees) / 2  # B
-        m_expand = m.view(-1, 1, 1).expand(-1, C, C)  # B x C x C
+        # m_expand = m.view(-1, 1, 1).expand(-1, C, C)  # B x C x C
 
         ca = torch.matmul(s.transpose(1, 2), degrees)  # B x C x 1
         cb = torch.matmul(degrees_t, s)  # B x 1 x C
 
-        normalizer = torch.matmul(ca, cb) / 2 / m_expand
-        decompose = out_adj - normalizer
-        spectral_loss = -_rank3_trace(decompose) / 2 / m
+        # the trace of the normalizer is ca · cb / 2m, so the K × K normalizer is not computed either
+        # normalizer = torch.matmul(ca, cb) / 2 / m_expand
+        # decompose = out_adj - normalizer
+        # spectral_loss = -_rank3_trace(decompose) / 2 / m
+        spectral_loss = -(torch.sum(s[0] * (adj @ s[0])) - torch.sum(ca[0, :, 0] * cb[0, 0, :]) / 2 / m) / 2 / m
         spectral_loss = spectral_loss.mean()
 
         # Orthogonality regularization:
-        ss = torch.matmul(s.transpose(1, 2), s)
-        i_s = torch.eye(C).type_as(ss)
-        ortho_loss = torch.norm(
-            ss / torch.norm(ss, dim=(-1, -2), keepdim=True) - i_s / torch.norm(i_s),
-            dim=(-1, -2),
-        )
-        ortho_loss = ortho_loss.mean()
+        # DMoN leaves the orthogonality loss out of its loss, as the original implementation does, so it is not computed
+        # ss = torch.matmul(s.transpose(1, 2), s)
+        # i_s = torch.eye(C).type_as(ss)
+        # ortho_loss = torch.norm(
+        #     ss / torch.norm(ss, dim=(-1, -2), keepdim=True) - i_s / torch.norm(i_s),
+        #     dim=(-1, -2),
+        # )
+        # ortho_loss = ortho_loss.mean()
 
         # Cluster loss:
         cluster_size = torch.einsum("ijk->ik", s)  # B x C
         cluster_loss = torch.norm(input=cluster_size, dim=1)
-        cluster_loss = cluster_loss / mask.sum(dim=1) * torch.norm(i_s) - 1
+        # cluster_loss = cluster_loss / mask.sum(dim=1) * torch.norm(i_s) - 1
+        # the norm of the C × C identity is √C, so the identity is not built
+        cluster_loss = cluster_loss / mask.sum(dim=1) * math.sqrt(C) - 1
         cluster_loss = cluster_loss.mean()
 
-        # Fix and normalize coarsened adjacency matrix:
-        ind = torch.arange(C, device=out_adj.device)
-        out_adj[:, ind, ind] = 0
-        d = torch.einsum("ijk->ij", out_adj)
-        d = torch.sqrt(d)[:, None] + EPS
-        out_adj = (out_adj / d) / d.transpose(1, 2)
+        # no loss uses the coarsened adjacency matrix, so it is not fixed and normalized
+        # # Fix and normalize coarsened adjacency matrix:
+        # ind = torch.arange(C, device=out_adj.device)
+        # out_adj[:, ind, ind] = 0
+        # d = torch.einsum("ijk->ij", out_adj)
+        # d = torch.sqrt(d)[:, None] + EPS
+        # out_adj = (out_adj / d) / d.transpose(1, 2)
 
-        return s, out, out_adj, spectral_loss, ortho_loss, cluster_loss
+        # return s, out, out_adj, spectral_loss, ortho_loss, cluster_loss
+        return s, None, None, spectral_loss, None, cluster_loss
 
     def __repr__(self) -> str:
         return (
