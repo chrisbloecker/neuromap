@@ -10,12 +10,28 @@ import torch.nn.functional as F
 from torch_geometric.typing import OptTensor, SparseTensor
 from torch_geometric.nn.models.mlp import MLP
 
+from model import row_slice
+
+
+def pool_features(s: Tensor, x: Tensor, chunk_size: int) -> Tensor:
+    """
+    sᵀ x, for x in CPU memory, sparse in CSR format or dense, and s on the GPU.
+    x's rows move to the GPU chunk_size at a time.
+    The result has no gradient: the pooled features are not part of any loss, and their autograd graph would keep every chunk on the GPU.
+    """
+    s   = s.detach()
+    out = torch.zeros(s.size(1), x.size(1), device = s.device)
+    for start in range(0, x.size(0), chunk_size):
+        end = min(start + chunk_size, x.size(0))
+        out += s[start:end].t() @ row_slice(x, start, end).to(s.device)
+    return out
+
 
 # diff_pool, mincut_pool and DMoNPooling are dense_diff_pool, dense_mincut_pool and DMoNPooling from PyG 2.8.1
-# they are changed where adj is a sparse matrix, in CSR format for mincut_pool and DMoNPooling
+# they are changed where adj is a sparse matrix, in CSR format for mincut_pool and DMoNPooling, where x stays in CPU memory in batched training, and in DiffPool's link loss
 # they make the identity matrix on the assignments' device instead of on the CPU
 # they leave out what no loss in training.py uses and return None in its place:
-# the pooled features, the pooled adjacency matrix and DMoN's orthogonality loss
+# the pooled features, the pooled adjacency matrix of mincut_pool and DMoNPooling, and DMoN's orthogonality loss
 # mincut_pool and DMoNPooling take the traces in their losses as sums of elementwise products, without the K × K matrices
 # each changed line has PyG's version as a comment above it
 def diff_pool(
@@ -24,6 +40,7 @@ def diff_pool(
     s: Tensor,
     mask: Optional[Tensor] = None,
     normalize: bool = True,
+    chunk_size: Optional[int] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     r"""The differentiable pooling operator from the `"Hierarchical Graph
     Representation Learning with Differentiable Pooling"
@@ -69,15 +86,21 @@ def diff_pool(
         normalize (bool, optional): If set to :obj:`False`, the link
             prediction loss is not divided by :obj:`adj.numel()`.
             (default: :obj:`True`)
+        chunk_size (int, optional): Set in batched training, where
+            :obj:`x` stays in CPU memory and can be a CSR matrix, which
+            cannot be unsqueezed. Then :obj:`x` is left as it is.
+            (default: :obj:`None`)
 
     :rtype: (:class:`torch.Tensor`, :class:`torch.Tensor`,
         :class:`torch.Tensor`, :class:`torch.Tensor`)
     """
-    x = x.unsqueeze(0) if x.dim() == 2 else x
+    # x = x.unsqueeze(0) if x.dim() == 2 else x
+    x = x.unsqueeze(0) if x.dim() == 2 and chunk_size is None else x
     adj = adj.unsqueeze(0) if adj.dim() == 2 else adj
     s = s.unsqueeze(0) if s.dim() == 2 else s
 
-    batch_size, num_nodes, _ = x.size()
+    # batch_size, num_nodes, _ = x.size()
+    batch_size, num_nodes, _ = s.size()
 
     s = torch.softmax(s, dim=-1)
 
@@ -85,13 +108,17 @@ def diff_pool(
         mask = mask.view(batch_size, num_nodes, 1).to(x.dtype)
         x, s = x * mask, s * mask
 
-    # no loss uses the pooled features and the pooled adjacency matrix, so they are not computed
+    # no loss uses the pooled features, so they are not computed
     # out = torch.matmul(s.transpose(1, 2), x)
     # out_adj = torch.matmul(torch.matmul(s.transpose(1, 2), adj), s)
+    out_adj = s[0].T @ torch.sparse.mm(adj[0], s[0])
+    out_adj = out_adj[None, :, :]
 
     # link_loss = adj - torch.matmul(s, s.transpose(1, 2))
-    link_loss = -torch.matmul(s, s.transpose(1, 2)) + adj
-    link_loss = torch.norm(link_loss, p=2)
+    # link_loss = torch.norm(link_loss, p=2)
+    # ‖A − s sᵀ‖² = ‖A‖² − 2 tr(sᵀ A s) + ‖sᵀ s‖², which needs no N × N matrix
+    # unsqueeze drops adj's coalesced flag, so read its stored entries with _values; callers store adj coalesced, so the entries are distinct
+    link_loss = torch.sqrt(torch.sum(adj._values()**2) - 2 * torch.sum(_rank3_trace(out_adj)) + torch.sum(torch.matmul(s.transpose(1, 2), s)**2))
     if normalize is True:
         link_loss = link_loss / adj.numel()
 
@@ -107,6 +134,7 @@ def mincut_pool(
     s: Tensor,
     mask: Optional[Tensor] = None,
     temp: float = 1.0,
+    chunk_size: Optional[int] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     r"""The MinCut pooling operator from the `"Spectral Clustering in Graph
     Neural Networks for Graph Pooling" <https://arxiv.org/abs/1907.00481>`_
@@ -155,17 +183,23 @@ def mincut_pool(
             the valid nodes for each graph. (default: :obj:`None`)
         temp (float, optional): Temperature parameter for softmax function.
             (default: :obj:`1.0`)
+        chunk_size (int, optional): Set in batched training, where
+            :obj:`x` stays in CPU memory and can be a CSR matrix, which
+            cannot be unsqueezed. Then :obj:`x` is left as it is.
+            (default: :obj:`None`)
 
     :rtype: (:class:`torch.Tensor`, :class:`torch.Tensor`,
         :class:`torch.Tensor`, :class:`torch.Tensor`)
     """
 
-    x = x.unsqueeze(0) if x.dim() == 2 else x
+    # x = x.unsqueeze(0) if x.dim() == 2 else x
+    x = x.unsqueeze(0) if x.dim() == 2 and chunk_size is None else x
     # adj = adj.unsqueeze(0) if adj.dim() == 2 else adj
     # adj stays a 2D matrix in CSR format, which has no 3D form
     s = s.unsqueeze(0) if s.dim() == 2 else s
 
-    (batch_size, num_nodes, _), k = x.size(), s.size(-1)
+    # (batch_size, num_nodes, _), k = x.size(), s.size(-1)
+    (batch_size, num_nodes, _), k = s.size(), s.size(-1)
 
     s = torch.softmax(s / temp if temp != 1.0 else s, dim=-1)
 
@@ -205,6 +239,10 @@ def mincut_pool(
 
     # return out, out_adj, mincut_loss, ortho_loss
     return None, None, mincut_loss, ortho_loss
+
+
+def _rank3_trace(x: Tensor) -> Tensor:
+    return torch.einsum("ijj->i", x)
 
 
 def orthogonality_loss(s: Tensor) -> Tensor:
